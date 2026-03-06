@@ -4,6 +4,7 @@
 //! Responses API (`/v1/responses`). This provider supports the Codex model family
 //! and other agentic `OpenAI` models that expose the Responses surface.
 
+use crate::llm::attachments::validate_request_attachments;
 use crate::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Effort, LlmProvider, StopReason,
     StreamBox, StreamDelta, ThinkingConfig, ThinkingMode, Usage,
@@ -106,6 +107,9 @@ impl LlmProvider for OpenAIResponsesProvider {
             Ok(thinking) => thinking,
             Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
         };
+        if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
+            return Ok(ChatOutcome::InvalidRequest(error.to_string()));
+        }
         let reasoning = build_api_reasoning(thinking_config.as_ref());
         let input = build_api_input(&request);
         let tools: Option<Vec<ApiTool>> = request
@@ -215,6 +219,13 @@ impl LlmProvider for OpenAIResponsesProvider {
                     return;
                 }
             };
+            if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
+                yield Ok(StreamDelta::Error {
+                    message: error.to_string(),
+                    recoverable: false,
+                });
+                return;
+            }
             let reasoning = build_api_reasoning(thinking_config.as_ref());
             let input = build_api_input(&request);
             let tools: Option<Vec<ApiTool>> = request
@@ -388,27 +399,34 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                 }));
             }
             Content::Blocks(blocks) => {
+                let mut content_parts = Vec::new();
+
                 for block in blocks {
                     match block {
                         ContentBlock::Text { text } => {
-                            items.push(ApiInputItem::Message(ApiMessage {
-                                role: match msg.role {
-                                    crate::llm::Role::User => ApiRole::User,
-                                    crate::llm::Role::Assistant => ApiRole::Assistant,
-                                },
-                                content: ApiMessageContent::Text(text.clone()),
-                            }));
+                            content_parts.push(ApiInputContent::Text { text: text.clone() });
                         }
-                        ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. }
-                        | ContentBlock::Image { .. }
-                        | ContentBlock::Document { .. } => {
-                            // These blocks are not sent to the OpenAI API
+                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
+                        ContentBlock::Image { source } => {
+                            content_parts.push(ApiInputContent::Image {
+                                image_url: format!(
+                                    "data:{};base64,{}",
+                                    source.media_type, source.data
+                                ),
+                            });
+                        }
+                        ContentBlock::Document { source } => {
+                            content_parts.push(ApiInputContent::File {
+                                filename: suggested_filename(&source.media_type),
+                                file_data: format!(
+                                    "data:{};base64,{}",
+                                    source.media_type, source.data
+                                ),
+                            });
                         }
                         ContentBlock::ToolUse {
                             id, name, input, ..
                         } => {
-                            // Tool use from assistant becomes a function_call in output history
                             items.push(ApiInputItem::FunctionCall(ApiFunctionCall::new(
                                 id.clone(),
                                 name.clone(),
@@ -420,12 +438,21 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
                             content,
                             ..
                         } => {
-                            // Tool result becomes function_call_output
                             items.push(ApiInputItem::FunctionCallOutput(
                                 ApiFunctionCallOutput::new(tool_use_id.clone(), content.clone()),
                             ));
                         }
                     }
+                }
+
+                if !content_parts.is_empty() {
+                    items.push(ApiInputItem::Message(ApiMessage {
+                        role: match msg.role {
+                            crate::llm::Role::User => ApiRole::User,
+                            crate::llm::Role::Assistant => ApiRole::Assistant,
+                        },
+                        content: ApiMessageContent::Parts(content_parts),
+                    }));
                 }
             }
         }
@@ -503,6 +530,17 @@ fn convert_tool(tool: crate::llm::Tool) -> ApiTool {
         description: Some(tool.description),
         parameters: Some(schema),
         strict: Some(true),
+    }
+}
+
+fn suggested_filename(media_type: &str) -> String {
+    match media_type {
+        "application/pdf" => "attachment.pdf".to_string(),
+        "image/png" => "image.png".to_string(),
+        "image/jpeg" => "image.jpg".to_string(),
+        "image/gif" => "image.gif".to_string(),
+        "image/webp" => "image.webp".to_string(),
+        _ => "attachment.bin".to_string(),
     }
 }
 
@@ -661,6 +699,15 @@ enum ApiRole {
 #[serde(untagged)]
 enum ApiMessageContent {
     Text(String),
+    Parts(Vec<ApiInputContent>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ApiInputContent {
+    Text { text: String },
+    Image { image_url: String },
+    File { filename: String, file_data: String },
 }
 
 #[derive(Serialize)]
