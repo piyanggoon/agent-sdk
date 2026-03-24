@@ -475,14 +475,7 @@ fn build_api_input(request: &ChatRequest) -> Vec<ApiInputItem> {
 }
 
 /// Recursively fix a JSON schema for `OpenAI` strict mode.
-///
-/// Strict mode requires:
-/// 1. `additionalProperties: false` on every object schema.
-/// 2. Every key in `properties` must appear in `required`.
-///
-/// Properties that were NOT originally required are wrapped in
-/// `anyOf: [{original_schema}, {"type": "null"}]` so the model can
-/// still omit them by sending `null`.
+/// Adds `additionalProperties: false` and ensures all properties are required.
 fn fix_schema_for_strict_mode(schema: &mut serde_json::Value) {
     let Some(obj) = schema.as_object_mut() else {
         return;
@@ -499,26 +492,6 @@ fn fix_schema_for_strict_mode(schema: &mut serde_json::Value) {
             "additionalProperties".to_owned(),
             serde_json::Value::Bool(false),
         );
-
-        // Collect the set of originally required keys
-        let originally_required: std::collections::HashSet<String> = obj
-            .get("required")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Wrap previously-optional properties in anyOf with null
-        if let Some(serde_json::Value::Object(props)) = obj.get_mut("properties") {
-            for (key, prop_schema) in props.iter_mut() {
-                if !originally_required.contains(key) {
-                    make_nullable(prop_schema);
-                }
-            }
-        }
 
         // Ensure all properties are marked as required
         if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
@@ -554,33 +527,6 @@ fn fix_schema_for_strict_mode(schema: &mut serde_json::Value) {
             }
         }
     }
-}
-
-/// Wrap a schema in `anyOf: [{original}, {"type": "null"}]` so that
-/// the property accepts its original type OR null.
-///
-/// If the schema already has an `anyOf`, appends `{"type": "null"}` to it.
-fn make_nullable(schema: &mut serde_json::Value) {
-    // Already nullable via anyOf — append null variant if missing
-    if let Some(any_of) = schema
-        .as_object_mut()
-        .and_then(|o| o.get_mut("anyOf"))
-        .and_then(|v| v.as_array_mut())
-    {
-        let has_null = any_of
-            .iter()
-            .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("null"));
-        if !has_null {
-            any_of.push(serde_json::json!({"type": "null"}));
-        }
-        return;
-    }
-
-    // Wrap the original schema in anyOf
-    let original = schema.clone();
-    *schema = serde_json::json!({
-        "anyOf": [original, {"type": "null"}]
-    });
 }
 
 fn convert_tool(tool: crate::llm::Tool) -> ApiTool {
