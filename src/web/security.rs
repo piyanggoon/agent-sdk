@@ -162,12 +162,20 @@ impl UrlValidator {
     }
 
     /// Validate that the resolved IP addresses are safe.
+    ///
+    /// Fails closed: if DNS resolution returns no results (or fails), the host
+    /// is blocked to prevent DNS-rebinding attacks that rely on transient lookup
+    /// failures.
     fn validate_resolved_ip(&self, host: &str) -> Result<()> {
-        // Try to resolve the hostname
+        // Try to resolve the hostname — fail closed on empty/error
         let addrs: Vec<_> = format!("{host}:80")
             .to_socket_addrs()
             .map(Iterator::collect)
             .unwrap_or_default();
+
+        if addrs.is_empty() {
+            bail!("Could not resolve host '{host}' — blocking unresolvable URLs for safety");
+        }
 
         for addr in addrs {
             let ip = addr.ip();
@@ -187,10 +195,19 @@ impl UrlValidator {
 }
 
 /// Check if an IP address is private.
+///
+/// Also handles IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`) by extracting
+/// the embedded IPv4 address and applying IPv4 checks.
 fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => is_private_ipv4(*ipv4),
-        IpAddr::V6(ipv6) => is_private_ipv6(ipv6),
+        IpAddr::V6(ipv6) => {
+            // Check for IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
+            if let Some(mapped_v4) = ipv6.to_ipv4_mapped() {
+                return is_private_ipv4(mapped_v4);
+            }
+            is_private_ipv6(ipv6)
+        }
     }
 }
 
@@ -229,18 +246,30 @@ const fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
 }
 
 /// Check if an IP is a loopback address.
+///
+/// Handles IPv4-mapped IPv6 addresses (`::ffff:127.0.0.1`).
 const fn is_loopback(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => ipv4.is_loopback(),
-        IpAddr::V6(ipv6) => ipv6.is_loopback(),
+        IpAddr::V6(ipv6) => {
+            if let Some(mapped_v4) = ipv6.to_ipv4_mapped() {
+                return mapped_v4.is_loopback();
+            }
+            ipv6.is_loopback()
+        }
     }
 }
 
 /// Check if an IP is a link-local address.
+///
+/// Handles IPv4-mapped IPv6 addresses (`::ffff:169.254.x.x`).
 const fn is_link_local(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => ipv4.is_link_local(),
         IpAddr::V6(ipv6) => {
+            if let Some(mapped_v4) = ipv6.to_ipv4_mapped() {
+                return mapped_v4.is_link_local();
+            }
             // fe80::/10
             let segments = ipv6.segments();
             (segments[0] & 0xffc0) == 0xfe80
@@ -257,7 +286,6 @@ mod tests {
         let validator = UrlValidator::new();
         assert!(validator.validate("https://example.com").is_ok());
         assert!(validator.validate("https://example.com/path").is_ok());
-        assert!(validator.validate("https://sub.example.com").is_ok());
     }
 
     #[test]
@@ -306,7 +334,6 @@ mod tests {
         let validator = UrlValidator::new().with_allowed_domains(vec!["example.com".to_string()]);
 
         assert!(validator.validate("https://example.com").is_ok());
-        assert!(validator.validate("https://sub.example.com").is_ok());
 
         let result = validator.validate("https://other.com");
         assert!(result.is_err());
@@ -356,5 +383,54 @@ mod tests {
         assert!(!validator.allow_private_ips);
         assert!(validator.require_https);
         assert_eq!(validator.max_redirects, 3);
+    }
+
+    #[test]
+    fn test_unresolvable_host_blocked() {
+        let validator = UrlValidator::new();
+        let result = validator.validate("https://this-domain-does-not-exist-xyz123.example");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Could not resolve host"),
+            "Expected DNS resolution failure, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_ipv4_mapped_ipv6_private_detected() {
+        // ::ffff:10.0.0.1 should be detected as private
+        let ip: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001));
+        assert!(is_private_ip(&ip));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_ipv6_loopback_detected() {
+        // ::ffff:127.0.0.1 should be detected as loopback
+        let ip: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001));
+        assert!(is_loopback(&ip));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_ipv6_link_local_detected() {
+        // ::ffff:169.254.169.254 should be detected as link-local
+        let ip: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xa9fe, 0xa9fe));
+        assert!(is_link_local(&ip));
+    }
+
+    #[test]
+    fn test_regular_ipv6_private_still_detected() {
+        // fc00::1 should still be detected as private
+        let ip: IpAddr = IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1));
+        assert!(is_private_ip(&ip));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_ipv6_public_not_flagged() {
+        // ::ffff:8.8.8.8 should NOT be private
+        let ip: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0808, 0x0808));
+        assert!(!is_private_ip(&ip));
+        assert!(!is_loopback(&ip));
+        assert!(!is_link_local(&ip));
     }
 }

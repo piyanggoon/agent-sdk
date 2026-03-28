@@ -163,6 +163,10 @@ where
     hooks: Arc<H>,
     message_store_factory: Arc<dyn Fn() -> M + Send + Sync>,
     state_store_factory: Arc<dyn Fn() -> S + Send + Sync>,
+    /// Cached display name to avoid `Box::leak` on every call.
+    cached_display_name: &'static str,
+    /// Cached description to avoid `Box::leak` on every call.
+    cached_description: &'static str,
 }
 
 impl<P> SubagentTool<P, DefaultHooks, InMemoryStore, InMemoryStore>
@@ -172,6 +176,15 @@ where
     /// Create a new subagent tool with default hooks and in-memory stores.
     #[must_use]
     pub fn new(config: SubagentConfig, provider: Arc<P>, tools: Arc<ToolRegistry<()>>) -> Self {
+        // Cache leaked strings at construction time (bounded by number of tools)
+        let cached_display_name = Box::leak(format!("Subagent: {}", config.name).into_boxed_str());
+        let cached_description = Box::leak(
+            format!(
+                "Spawn a subagent named '{}' to handle a task. The subagent will work independently and return only its final response.",
+                config.name
+            )
+            .into_boxed_str(),
+        );
         Self {
             config,
             provider,
@@ -179,6 +192,8 @@ where
             hooks: Arc::new(DefaultHooks),
             message_store_factory: Arc::new(InMemoryStore::new),
             state_store_factory: Arc::new(InMemoryStore::new),
+            cached_display_name,
+            cached_description,
         }
     }
 }
@@ -203,6 +218,8 @@ where
             hooks,
             message_store_factory: self.message_store_factory,
             state_store_factory: self.state_store_factory,
+            cached_display_name: self.cached_display_name,
+            cached_description: self.cached_description,
         }
     }
 
@@ -226,6 +243,8 @@ where
             hooks: self.hooks,
             message_store_factory: Arc::new(message_factory),
             state_store_factory: Arc::new(state_factory),
+            cached_display_name: self.cached_display_name,
+            cached_description: self.cached_description,
         }
     }
 
@@ -239,6 +258,9 @@ where
     ///
     /// If `parent_tx` is provided, the subagent will emit `SubagentProgress` events
     /// to the parent's event channel, allowing the UI to show live progress.
+    ///
+    /// The `parent_cancel` token links the subagent's lifecycle to its parent.
+    /// Cancelling the parent token will also cancel the subagent.
     #[allow(clippy::too_many_lines)]
     async fn run_subagent(
         &self,
@@ -246,6 +268,7 @@ where
         subagent_id: String,
         parent_tx: Option<mpsc::Sender<AgentEventEnvelope>>,
         parent_seq: Option<SequenceCounter>,
+        parent_cancel: CancellationToken,
     ) -> Result<SubagentResult> {
         use crate::agent_loop::AgentLoop;
 
@@ -256,9 +279,9 @@ where
         let message_store = (self.message_store_factory)();
         let state_store = (self.state_store_factory)();
 
-        // Create agent config
+        // Create agent config with a default max_turns to prevent unbounded execution
         let agent_config = AgentConfig {
-            max_turns: self.config.max_turns,
+            max_turns: Some(self.config.max_turns.unwrap_or(100)),
             system_prompt: self.config.system_prompt.clone(),
             ..Default::default()
         };
@@ -276,12 +299,14 @@ where
         // Create tool context
         let tool_ctx = ToolContext::new(());
 
-        // Run with optional timeout
+        // Run with a child cancellation token so parent cancellation propagates
+        let cancel_token = parent_cancel.child_token();
+        let timeout_cancel = cancel_token.clone();
         let (mut rx, _final_state) = agent.run(
             thread_id,
             AgentInput::Text(task.to_string()),
             tool_ctx,
-            CancellationToken::new(),
+            cancel_token,
         );
 
         let mut final_response = String::new();
@@ -299,6 +324,7 @@ where
             let recv_result = if let Some(timeout) = timeout_duration {
                 let remaining = timeout.saturating_sub(start.elapsed());
                 if remaining.is_zero() {
+                    timeout_cancel.cancel(); // Cancel the child agent on timeout
                     final_response = "Subagent timed out".to_string();
                     success = false;
                     break;
@@ -397,6 +423,7 @@ where
                 },
                 Ok(None) => break,
                 Err(_) => {
+                    timeout_cancel.cancel(); // Cancel the child agent on timeout
                     final_response = "Subagent timed out".to_string();
                     success = false;
                     break;
@@ -434,9 +461,9 @@ fn extract_tool_context(name: &str, input: &Value) -> String {
             .to_string(),
         "bash" => {
             let cmd = input.get("command").and_then(Value::as_str).unwrap_or("");
-            // Truncate long commands
+            // Truncate long commands (UTF-8 safe)
             if cmd.len() > 60 {
-                format!("{}...", &cmd[..57])
+                format!("{}...", crate::primitive_tools::truncate_str(cmd, 57))
             } else {
                 cmd.to_string()
             }
@@ -460,7 +487,10 @@ fn summarize_tool_result(name: &str, result: &ToolResult) -> String {
     if !result.success {
         let first_line = result.output.lines().next().unwrap_or("Error");
         return if first_line.len() > 50 {
-            format!("{}...", &first_line[..47])
+            format!(
+                "{}...",
+                crate::primitive_tools::truncate_str(first_line, 47)
+            )
         } else {
             first_line.to_string()
         };
@@ -480,7 +510,7 @@ fn summarize_tool_result(name: &str, result: &ToolResult) -> String {
             } else if lines.len() == 1 {
                 let line = lines[0];
                 if line.len() > 50 {
-                    format!("{}...", &line[..47])
+                    format!("{}...", crate::primitive_tools::truncate_str(line, 47))
                 } else {
                     line.to_string()
                 }
@@ -521,18 +551,11 @@ where
     }
 
     fn display_name(&self) -> &'static str {
-        // Leak the name to get 'static lifetime (acceptable for long-lived tools)
-        Box::leak(format!("Subagent: {}", self.config.name).into_boxed_str())
+        self.cached_display_name
     }
 
     fn description(&self) -> &'static str {
-        Box::leak(
-            format!(
-                "Spawn a subagent named '{}' to handle a task. The subagent will work independently and return only its final response.",
-                self.config.name
-            )
-            .into_boxed_str(),
-        )
+        self.cached_description
     }
 
     fn input_schema(&self) -> Value {
@@ -573,8 +596,12 @@ where
                 .as_nanos()
         );
 
+        // Use the context's cancellation token if available, otherwise create a standalone one.
+        // This ensures that when a parent agent is cancelled, subagents are also cancelled.
+        let cancel_token = ctx.cancel_token().unwrap_or_default();
+
         let result = self
-            .run_subagent(task, subagent_id, parent_tx, parent_seq)
+            .run_subagent(task, subagent_id, parent_tx, parent_seq, cancel_token)
             .await?;
 
         Ok(ToolResult {

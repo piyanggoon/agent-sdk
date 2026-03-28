@@ -48,6 +48,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 // ============================================================================
 // Tool Name Types
@@ -75,15 +76,12 @@ pub trait ToolName: Send + Sync + Serialize + DeserializeOwned + 'static {}
 
 /// Helper to get string representation of a tool name via serde.
 ///
-/// # Panics
-///
-/// Panics if the tool name cannot be serialized to a string. This should
-/// never happen with properly implemented `ToolName` types that use
-/// `#[derive(Serialize)]`.
+/// Returns `"<unknown_tool>"` if serialization fails (should never happen
+/// with properly implemented `ToolName` types that use `#[derive(Serialize)]`).
 #[must_use]
 pub fn tool_name_to_string<N: ToolName>(name: &N) -> String {
     serde_json::to_string(name)
-        .expect("ToolName must serialize to string")
+        .unwrap_or_else(|_| "\"<unknown_tool>\"".to_string())
         .trim_matches('"')
         .to_string()
 }
@@ -295,6 +293,8 @@ pub struct ToolContext<Ctx> {
     event_tx: Option<mpsc::Sender<AgentEventEnvelope>>,
     /// Optional sequence counter for wrapping events in envelopes
     event_seq: Option<SequenceCounter>,
+    /// Optional cancellation token for propagating cancellation to subtasks
+    cancel_token: Option<CancellationToken>,
 }
 
 impl<Ctx> ToolContext<Ctx> {
@@ -305,6 +305,7 @@ impl<Ctx> ToolContext<Ctx> {
             metadata: HashMap::new(),
             event_tx: None,
             event_seq: None,
+            cancel_token: None,
         }
     }
 
@@ -357,6 +358,22 @@ impl<Ctx> ToolContext<Ctx> {
     #[must_use]
     pub fn event_seq(&self) -> Option<SequenceCounter> {
         self.event_seq.clone()
+    }
+
+    /// Set the cancellation token for propagating cancellation to subtasks.
+    #[must_use]
+    pub fn with_cancel_token(mut self, token: CancellationToken) -> Self {
+        self.cancel_token = Some(token);
+        self
+    }
+
+    /// Get the cancellation token (if set).
+    ///
+    /// Used by tools that spawn long-running subtasks (like subagents)
+    /// to propagate cancellation from the parent.
+    #[must_use]
+    pub fn cancel_token(&self) -> Option<CancellationToken> {
+        self.cancel_token.clone()
     }
 }
 

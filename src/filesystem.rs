@@ -4,7 +4,7 @@
 //! - `LocalFileSystem` - Standard filesystem operations using `std::fs`
 //! - `InMemoryFileSystem` - In-memory filesystem for testing
 
-use crate::environment::{Environment, ExecResult, FileEntry, GrepMatch};
+use crate::environment::{self, Environment, ExecResult, FileEntry, GrepMatch};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -23,11 +23,12 @@ impl LocalFileSystem {
     }
 
     fn resolve(&self, path: &str) -> PathBuf {
-        if Path::new(path).is_absolute() {
+        let joined = if Path::new(path).is_absolute() {
             PathBuf::from(path)
         } else {
             self.root.join(path)
-        }
+        };
+        environment::normalize_path_buf(&joined)
     }
 }
 
@@ -195,7 +196,13 @@ impl Environment for LocalFileSystem {
     }
 
     fn root(&self) -> &str {
-        self.root.to_str().unwrap_or("/")
+        self.root.to_str().unwrap_or_else(|| {
+            log::error!(
+                "LocalFileSystem root path contains invalid UTF-8: {}",
+                self.root.to_string_lossy()
+            );
+            "/"
+        })
     }
 }
 
