@@ -35,6 +35,7 @@
 
 use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 use crate::llm;
+use crate::plan_mode::{METADATA_PLAN_MODE_ALLOWED_TOOLS, METADATA_PLAN_MODE_ENABLED};
 use crate::types::{ToolOutcome, ToolResult, ToolTier};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -49,6 +50,62 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+pub const METADATA_ENVIRONMENT_DETAILS: &str = "environment_details";
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_repository: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub directories: Vec<String>,
+}
+
+impl EnvironmentDetails {
+    #[must_use]
+    pub fn with_working_directory(mut self, working_directory: impl Into<String>) -> Self {
+        self.working_directory = Some(working_directory.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_workspace_root(mut self, workspace_root: impl Into<String>) -> Self {
+        self.workspace_root = Some(workspace_root.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_platform(mut self, platform: impl Into<String>) -> Self {
+        self.platform = Some(platform.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_shell(mut self, shell: impl Into<String>) -> Self {
+        self.shell = Some(shell.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn with_git_repository(mut self, git_repository: bool) -> Self {
+        self.git_repository = Some(git_repository);
+        self
+    }
+
+    #[must_use]
+    pub fn with_directories(mut self, directories: Vec<String>) -> Self {
+        self.directories = directories;
+        self
+    }
+}
 
 // ============================================================================
 // Tool Name Types
@@ -110,6 +167,9 @@ pub enum PrimitiveToolName {
     TodoRead,
     TodoWrite,
     AskUser,
+    Task,
+    EnterPlanMode,
+    ExitPlanMode,
     LinkFetch,
     WebSearch,
 }
@@ -299,6 +359,28 @@ pub struct ToolContext<Ctx> {
     subagent_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
+impl<Ctx: Clone> Clone for ToolContext<Ctx> {
+    fn clone(&self) -> Self {
+        Self {
+            app: self.app.clone(),
+            metadata: self.metadata.clone(),
+            event_tx: self.event_tx.clone(),
+            event_seq: self.event_seq.clone(),
+            cancel_token: self.cancel_token.clone(),
+            subagent_semaphore: self.subagent_semaphore.clone(),
+        }
+    }
+}
+
+/// Whether a tool may be used while the agent is in plan mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanModePolicy {
+    /// The tool is safe to use during read-only planning work.
+    Allowed,
+    /// The tool is blocked while plan mode is active unless explicitly allowlisted.
+    Blocked,
+}
+
 impl<Ctx> ToolContext<Ctx> {
     #[must_use]
     pub fn new(app: Ctx) -> Self {
@@ -316,6 +398,68 @@ impl<Ctx> ToolContext<Ctx> {
     pub fn with_metadata(mut self, key: impl Into<String>, value: Value) -> Self {
         self.metadata.insert(key.into(), value);
         self
+    }
+
+    #[must_use]
+    pub fn with_environment_details(mut self, details: EnvironmentDetails) -> Self {
+        self.set_environment_details(details);
+        self
+    }
+
+    pub fn set_environment_details(&mut self, details: EnvironmentDetails) {
+        if let Ok(value) = serde_json::to_value(details) {
+            self.metadata
+                .insert(METADATA_ENVIRONMENT_DETAILS.to_string(), value);
+        }
+    }
+
+    #[must_use]
+    pub fn environment_details(&self) -> Option<EnvironmentDetails> {
+        self.metadata
+            .get(METADATA_ENVIRONMENT_DETAILS)
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+
+    /// Annotate the context with plan mode state.
+    #[must_use]
+    pub fn with_plan_mode(mut self, enabled: bool, allowed_tools: Vec<String>) -> Self {
+        self.set_plan_mode(enabled, allowed_tools);
+        self
+    }
+
+    /// Update plan mode state on an existing context.
+    pub fn set_plan_mode(&mut self, enabled: bool, allowed_tools: Vec<String>) {
+        self.metadata
+            .insert(METADATA_PLAN_MODE_ENABLED.to_string(), Value::Bool(enabled));
+        self.metadata.insert(
+            METADATA_PLAN_MODE_ALLOWED_TOOLS.to_string(),
+            Value::Array(allowed_tools.into_iter().map(Value::String).collect()),
+        );
+    }
+
+    /// Returns true when plan mode is active for the current turn.
+    #[must_use]
+    pub fn plan_mode_enabled(&self) -> bool {
+        self.metadata
+            .get(METADATA_PLAN_MODE_ENABLED)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    /// Returns the extra tool allowlist for plan mode.
+    #[must_use]
+    pub fn plan_mode_allowed_tools(&self) -> Vec<String> {
+        self.metadata
+            .get(METADATA_PLAN_MODE_ALLOWED_TOOLS)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Set the event channel and sequence counter for tools that need to emit
@@ -429,6 +573,11 @@ pub trait Tool<Ctx>: Send + Sync {
         ToolTier::Observe
     }
 
+    /// Whether this tool can be used while the agent is in plan mode.
+    fn plan_mode_policy(&self) -> PlanModePolicy {
+        PlanModePolicy::Blocked
+    }
+
     /// Execute the tool with the given input.
     ///
     /// # Errors
@@ -511,6 +660,11 @@ pub trait AsyncTool<Ctx>: Send + Sync {
         ToolTier::Observe
     }
 
+    /// Whether this tool can be used while the agent is in plan mode.
+    fn plan_mode_policy(&self) -> PlanModePolicy {
+        PlanModePolicy::Blocked
+    }
+
     /// Execute the tool. Returns immediately with one of:
     /// - Success/Failed: Operation completed synchronously
     /// - `InProgress`: Operation started, use `check_status()` to stream updates
@@ -565,6 +719,11 @@ pub trait ListenExecuteTool<Ctx>: Send + Sync {
     /// Permission tier for this tool.
     fn tier(&self) -> ToolTier {
         ToolTier::Confirm
+    }
+
+    /// Whether this tool can be used while the agent is in plan mode.
+    fn plan_mode_policy(&self) -> PlanModePolicy {
+        PlanModePolicy::Blocked
     }
 
     /// Start and stream runtime preparation updates.
@@ -627,6 +786,8 @@ pub trait ErasedTool<Ctx>: Send + Sync {
     fn input_schema(&self) -> Value;
     /// Get the tool's permission tier.
     fn tier(&self) -> ToolTier;
+    /// Whether the tool is available in plan mode.
+    fn plan_mode_policy(&self) -> PlanModePolicy;
     /// Execute the tool with the given input.
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult>;
 }
@@ -681,6 +842,10 @@ where
         self.inner.tier()
     }
 
+    fn plan_mode_policy(&self) -> PlanModePolicy {
+        self.inner.plan_mode_policy()
+    }
+
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
         self.inner.execute(ctx, input).await
     }
@@ -706,6 +871,8 @@ pub trait ErasedAsyncTool<Ctx>: Send + Sync {
     fn input_schema(&self) -> Value;
     /// Get the tool's permission tier.
     fn tier(&self) -> ToolTier;
+    /// Whether the tool is available in plan mode.
+    fn plan_mode_policy(&self) -> PlanModePolicy;
     /// Execute the tool with the given input.
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolOutcome>;
     /// Stream status updates for an in-progress operation (type-erased).
@@ -766,6 +933,10 @@ where
         self.inner.tier()
     }
 
+    fn plan_mode_policy(&self) -> PlanModePolicy {
+        self.inner.plan_mode_policy()
+    }
+
     async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolOutcome> {
         self.inner.execute(ctx, input).await
     }
@@ -798,6 +969,8 @@ pub trait ErasedListenTool<Ctx>: Send + Sync {
     fn input_schema(&self) -> Value;
     /// Get the tool's permission tier.
     fn tier(&self) -> ToolTier;
+    /// Whether the tool is available in plan mode.
+    fn plan_mode_policy(&self) -> PlanModePolicy;
     /// Start listen stream.
     fn listen_stream<'a>(
         &'a self,
@@ -868,6 +1041,10 @@ where
 
     fn tier(&self) -> ToolTier {
         self.inner.tier()
+    }
+
+    fn plan_mode_policy(&self) -> PlanModePolicy {
+        self.inner.plan_mode_policy()
     }
 
     fn listen_stream<'a>(

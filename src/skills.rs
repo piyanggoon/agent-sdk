@@ -32,6 +32,7 @@
 //!     .build();
 //! ```
 
+pub mod builtin;
 pub mod loader;
 pub mod parser;
 
@@ -139,6 +140,7 @@ impl Skill {
     }
 }
 
+pub use builtin::{BuiltInSkill, built_in_skill, built_in_skills};
 pub use loader::{FileSkillLoader, SkillLoader};
 pub use parser::parse_skill_file;
 
@@ -158,6 +160,15 @@ mod tests {
         assert_eq!(skill.system_prompt, "You are a test assistant.");
         assert_eq!(skill.tools, vec!["read", "write"]);
         assert_eq!(skill.denied_tools, Some(vec!["bash".into()]));
+    }
+
+    #[test]
+    fn test_built_in_skill_helper() {
+        let skill = built_in_skill(BuiltInSkill::CodeReview);
+
+        assert_eq!(skill.name, "code-review");
+        assert!(skill.system_prompt.contains("code reviewer"));
+        assert!(skill.allowed_tools.is_some());
     }
 
     #[test]

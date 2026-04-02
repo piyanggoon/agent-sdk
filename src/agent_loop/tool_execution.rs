@@ -15,14 +15,103 @@ use super::types::{
 use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 use crate::hooks::{AgentHooks, ToolDecision};
 use crate::llm::{Content, ContentBlock, Message, Role};
+use crate::plan_mode::{rejection_tool_result, tool_result_followup_texts};
 use crate::stores::MessageStore;
 use crate::tools::{
-    ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus, ListenStopReason, ToolContext,
+    ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus, ListenStopReason,
+    PlanModePolicy, ToolContext,
 };
 use crate::types::{
     AgentError, ListenExecutionContext, PendingToolCallInfo, ThreadId, ToolOutcome, ToolResult,
     ToolTier,
 };
+
+fn lookup_tool_tier_and_plan_mode_policy<Ctx>(
+    tools: &crate::tools::ToolRegistry<Ctx>,
+    tool_name: &str,
+) -> Option<(ToolTier, PlanModePolicy)>
+where
+    Ctx: Send + Sync + 'static,
+{
+    if let Some(tool) = tools.get(tool_name) {
+        return Some((tool.tier(), tool.plan_mode_policy()));
+    }
+    if let Some(tool) = tools.get_async(tool_name) {
+        return Some((tool.tier(), tool.plan_mode_policy()));
+    }
+    if let Some(tool) = tools.get_listen(tool_name) {
+        return Some((tool.tier(), tool.plan_mode_policy()));
+    }
+    None
+}
+
+fn plan_mode_block_reason<Ctx>(
+    tool_name: &str,
+    plan_mode_policy: PlanModePolicy,
+    tool_context: &ToolContext<Ctx>,
+) -> Option<String> {
+    if !tool_context.plan_mode_enabled() {
+        return None;
+    }
+    if matches!(plan_mode_policy, PlanModePolicy::Allowed) {
+        return None;
+    }
+    if tool_context
+        .plan_mode_allowed_tools()
+        .iter()
+        .any(|allowed| allowed == tool_name)
+    {
+        return None;
+    }
+
+    Some(format!(
+        "Tool '{tool_name}' is not allowed in plan mode. Plan mode is read-only; use read-only tools, ask the user clarifying questions, or disable plan mode before implementation."
+    ))
+}
+
+async fn block_tool_call_in_plan_mode<Ctx, H>(
+    pending: &PendingToolCallInfo,
+    tier: ToolTier,
+    reason: String,
+    ctx: &ToolCallExecutionContext<'_, Ctx, H>,
+) -> ToolExecutionOutcome
+where
+    Ctx: Send + Sync + Clone + 'static,
+    H: AgentHooks,
+{
+    send_event(
+        ctx.tx,
+        ctx.hooks,
+        ctx.seq,
+        AgentEvent::tool_call_start(
+            &pending.id,
+            &pending.name,
+            &pending.display_name,
+            pending.input.clone(),
+            tier,
+        ),
+    )
+    .await;
+
+    let result = ToolResult::error(format!("Blocked: {reason}"));
+    send_event(
+        ctx.tx,
+        ctx.hooks,
+        ctx.seq,
+        AgentEvent::tool_call_end(
+            &pending.id,
+            &pending.name,
+            &pending.display_name,
+            result.clone(),
+        ),
+    )
+    .await;
+
+    ToolExecutionOutcome::Completed {
+        tool_id: pending.id.clone(),
+        result,
+    }
+}
 
 /// Execute a single tool call with hook checks.
 ///
@@ -156,10 +245,24 @@ where
     }
 
     if let Some(listen_tool) = ctx.tools.get_listen(&pending.name) {
+        if let Some(reason) = plan_mode_block_reason(
+            &pending.name,
+            listen_tool.plan_mode_policy(),
+            ctx.tool_context,
+        ) {
+            return block_tool_call_in_plan_mode(pending, listen_tool.tier(), reason, ctx).await;
+        }
         return execute_listen_tool_call(pending, listen_tool, ctx).await;
     }
 
     if let Some(async_tool) = ctx.tools.get_async(&pending.name) {
+        if let Some(reason) = plan_mode_block_reason(
+            &pending.name,
+            async_tool.plan_mode_policy(),
+            ctx.tool_context,
+        ) {
+            return block_tool_call_in_plan_mode(pending, async_tool.tier(), reason, ctx).await;
+        }
         return execute_async_tool_call(pending, async_tool, ctx).await;
     }
 
@@ -169,6 +272,12 @@ where
             result: ToolResult::error(format!("Unknown tool: {}", pending.name)),
         };
     };
+
+    if let Some(reason) =
+        plan_mode_block_reason(&pending.name, tool.plan_mode_policy(), ctx.tool_context)
+    {
+        return block_tool_call_in_plan_mode(pending, tool.tier(), reason, ctx).await;
+    }
 
     execute_sync_tool_call(pending, tool, ctx).await
 }
@@ -694,13 +803,20 @@ where
 
     // Defense-in-depth: re-check pre_tool_use for audit logging.
     // The user already confirmed, so we still execute even if the hook says Block.
-    let tier = ctx
-        .tools
-        .get(&awaiting_tool.name)
-        .map(|t| t.tier())
-        .or_else(|| ctx.tools.get_async(&awaiting_tool.name).map(|t| t.tier()))
-        .or_else(|| ctx.tools.get_listen(&awaiting_tool.name).map(|t| t.tier()))
-        .unwrap_or(ToolTier::Confirm);
+    let (tier, plan_mode_policy) =
+        lookup_tool_tier_and_plan_mode_policy(ctx.tools, &awaiting_tool.name)
+            .unwrap_or((ToolTier::Confirm, PlanModePolicy::Blocked));
+
+    if let Some(reason) =
+        plan_mode_block_reason(&awaiting_tool.name, plan_mode_policy, ctx.tool_context)
+    {
+        return finish_confirmed_tool(
+            awaiting_tool,
+            ctx,
+            ToolResult::error(format!("Blocked: {reason}")),
+        )
+        .await;
+    }
 
     let hook_decision = ctx
         .hooks
@@ -745,7 +861,8 @@ where
         .await;
     }
 
-    let result = ToolResult::error(format!("Rejected: {reason}"));
+    let result = rejection_tool_result(awaiting_tool, &reason)
+        .unwrap_or_else(|| ToolResult::error(format!("Rejected: {reason}")));
     send_event(
         ctx.tx,
         ctx.hooks,
@@ -901,6 +1018,10 @@ where
                 });
             }
         }
+    }
+
+    for text in tool_result_followup_texts(tool_results) {
+        blocks.push(ContentBlock::Text { text });
     }
 
     let batch_msg = Message {

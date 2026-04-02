@@ -663,18 +663,162 @@ Task statuses: `Pending` (○), `InProgress` (⚡), `Completed` (✓)
 Spawn isolated child agents for complex subtasks:
 
 ```rust
-use agent_sdk::{SubagentFactory, SubagentConfig, SubagentTool};
+use agent_sdk::{SubagentFactory, ToolRegistry};
 
-let factory = SubagentFactory::new(provider, subagent_tools);
-let config = SubagentConfig {
-    system_prompt: "You are a research assistant.".into(),
-    max_turns: Some(10),
-    ..Default::default()
-};
-let subagent_tool = SubagentTool::new(factory, config);
+let read_only = ToolRegistry::new();
+let full = ToolRegistry::new();
+
+let factory = SubagentFactory::new(provider.clone())
+    .with_read_only_registry(read_only)
+    .with_full_registry(full);
+
+let explore = factory.create_explore()?;
+let review = factory.create_code_review()?;
+let verify = factory.create_verification()?;
+let general = factory.create_general_purpose()?;
+let auto = factory.create_for_task("Review this patch for regressions")?;
 ```
 
 Subagents run in isolated threads with their own context and stream progress events back to the parent.
+
+Built-in defaults are also available via:
+
+- `SubagentConfig::explore()`
+- `SubagentConfig::plan()`
+- `SubagentConfig::verification()`
+- `SubagentConfig::code_review()`
+- `SubagentConfig::general_purpose()`
+
+`BuiltInSubagent::recommend_for_task(...)` and `SubagentFactory::create_for_task(...)` provide a simple Claude Code-style auto-router for common task descriptions.
+
+## Task Tool
+
+Use the first-class resumable `TaskTool` when you want a Claude Code-style subagent session with a `task_id`:
+
+```rust
+use agent_sdk::{SubagentFactory, TaskTool, ToolRegistry};
+use std::sync::Arc;
+
+let read_only = ToolRegistry::new();
+let full = ToolRegistry::new();
+
+let task_tool = TaskTool::new(
+    Arc::new(provider.clone()),
+    Arc::new(read_only),
+    Arc::new(full),
+);
+```
+
+The tool accepts:
+
+- `task`: subagent instruction or follow-up
+- `subagent_type`: optional preset like `explore`, `plan`, `verification`, `code_review`, or `general_purpose`
+- `task_id`: optional prior session id to continue the same subagent session
+
+## Built-in Skills And Prompt Presets
+
+Claude Code-style presets are available for common workflows:
+
+```rust
+use agent_sdk::{BuiltInSkill, built_in_skill};
+
+let review_skill = built_in_skill(BuiltInSkill::CodeReview);
+let agent = agent_sdk::builder::<()>()
+    .provider(provider)
+    .with_skill(review_skill)
+    .build();
+```
+
+Available built-in skills:
+
+- `BuiltInSkill::Explore`
+- `BuiltInSkill::Plan`
+- `BuiltInSkill::GeneralPurpose`
+- `BuiltInSkill::CodeReview`
+- `BuiltInSkill::Verification`
+- `BuiltInSkill::Commit`
+- `BuiltInSkill::PullRequest`
+
+Prompt presets are also exposed directly in `agent_sdk::preset_prompts`.
+
+## Session Memory
+
+Enable lightweight memory extraction and recall from user messages:
+
+```rust
+use agent_sdk::{AgentConfig, MemoryConfig};
+
+let config = AgentConfig::default().with_memory_config(
+    MemoryConfig::enabled().with_max_memories(12),
+);
+```
+
+The SDK extracts sticky preferences and workflow instructions from user text and injects them back into subsequent prompts as session memory.
+
+## Environment Details
+
+Attach richer environment details to the tool context so they appear in the runtime prompt:
+
+```rust
+use agent_sdk::{EnvironmentDetails, ToolContext};
+
+let tool_ctx = ToolContext::new(()).with_environment_details(
+    EnvironmentDetails::default()
+        .with_working_directory("/workspace")
+        .with_workspace_root("/workspace")
+        .with_shell("bash")
+        .with_git_repository(true),
+);
+```
+
+## Claude Code Presets
+
+Register the default subagents, the resumable task tool, plan mode tools, and session memory in one call:
+
+```rust
+use agent_sdk::{builder, ToolRegistry};
+
+let agent = builder::<()>()
+    .provider(provider)
+    .with_claude_code_presets(ToolRegistry::new(), ToolRegistry::new())
+    .build();
+```
+
+## Plan Mode
+
+Start an agent in read-only planning mode:
+
+```rust
+use agent_sdk::{builder, AgentConfig, PlanModeConfig};
+
+let config = AgentConfig::default().with_plan_mode_config(
+    PlanModeConfig::enabled()
+        .with_additional_allowed_tools(vec!["custom_readonly_tool".to_string()]),
+);
+
+let agent = builder::<()>()
+    .provider(provider)
+    .config(config)
+    .with_default_plan_mode_tools()
+    .build();
+```
+
+Or use the preset to enable plan mode and register the built-in tools in one call:
+
+```rust
+use agent_sdk::builder;
+
+let agent = builder::<()>()
+    .provider(provider)
+    .with_plan_mode_preset()
+    .build();
+```
+
+When plan mode is enabled, the SDK blocks non-allowlisted tools at execution time.
+This is intended for planning, exploration, and architecture work before implementation begins.
+
+- `EnterPlanModeTool` enables read-only planning mode for the current thread
+- `ExitPlanModeTool` exits plan mode with an approved plan payload and requires confirmation
 
 ## MCP Support
 

@@ -1,4 +1,6 @@
-use crate::{Environment, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
+use crate::{
+    Environment, PlanModePolicy, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier,
+};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -41,11 +43,15 @@ impl<E: Environment + 'static> Tool<()> for GlobTool<E> {
     }
 
     fn description(&self) -> &'static str {
-        "Find files matching a glob pattern. Supports ** for recursive matching."
+        "Fast glob-based file pattern matching for locating files by name or path pattern. Supports ** for recursive matching. Use this for file discovery instead of shell directory scans when the dedicated tool is available."
     }
 
     fn tier(&self) -> ToolTier {
         ToolTier::Observe
+    }
+
+    fn plan_mode_policy(&self) -> PlanModePolicy {
+        PlanModePolicy::Allowed
     }
 
     fn input_schema(&self) -> Value {

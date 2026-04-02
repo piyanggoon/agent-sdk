@@ -1,15 +1,69 @@
 use super::test_utils::*;
 use super::*;
 use crate::events::AgentEvent;
-use crate::hooks::AllowAllHooks;
+use crate::hooks::{AllowAllHooks, DefaultHooks};
 use crate::llm::{ChatOutcome, Content, ContentBlock};
+use crate::plan_mode::PlanModeConfig;
+use crate::plan_mode::{EnterPlanModeTool, ExitPlanModeTool, METADATA_LAST_APPROVED_PLAN};
+use crate::skills::Skill;
 use crate::stores::InMemoryStore;
-use crate::stores::MessageStore;
-use crate::tools::{ListenToolUpdate, ToolContext, ToolRegistry};
-use crate::types::{AgentConfig, AgentInput, TurnOutcome};
+use crate::stores::{MessageStore, StateStore};
+use crate::tools::{ListenToolUpdate, Tool, ToolContext, ToolName, ToolRegistry};
+use crate::types::{AgentConfig, AgentInput, ToolResult, ToolTier, TurnOutcome};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PlanTestToolName {
+    Inspect,
+}
+
+impl ToolName for PlanTestToolName {}
+
+struct PlanInspectTool;
+
+impl Tool<()> for PlanInspectTool {
+    type Name = PlanTestToolName;
+
+    fn name(&self) -> PlanTestToolName {
+        PlanTestToolName::Inspect
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Plan Inspect"
+    }
+
+    fn description(&self) -> &'static str {
+        "Synthetic tool for plan mode tests"
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "message": { "type": "string" }
+            }
+        })
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Observe
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolContext<()>,
+        input: serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        let message = input
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("done");
+        Ok(ToolResult::success(format!("Plan inspect: {message}")))
+    }
+}
 
 // ===================
 // Builder Tests
@@ -22,6 +76,8 @@ fn test_builder_creates_agent_loop() {
 
     assert_eq!(agent.config.max_turns, None);
     assert_eq!(agent.config.max_tokens, None);
+    assert!(agent.config.system_prompt.contains("# System"));
+    assert!(agent.config.system_prompt.contains("# Doing tasks"));
 }
 
 #[test]
@@ -54,6 +110,83 @@ fn test_builder_with_tools() {
 }
 
 #[test]
+fn test_builder_with_default_plan_mode_tools_registers_tools() {
+    let provider = MockProvider::new(vec![]);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .with_default_plan_mode_tools()
+        .build();
+
+    assert!(agent.tools.get("enter_plan_mode").is_some());
+    assert!(agent.tools.get("exit_plan_mode").is_some());
+    assert!(!agent.config.plan_mode.enabled);
+}
+
+#[test]
+fn test_builder_with_plan_mode_preset_registers_tools_and_enables_mode() {
+    let provider = MockProvider::new(vec![]);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .with_plan_mode_preset()
+        .build();
+
+    assert!(agent.tools.get("enter_plan_mode").is_some());
+    assert!(agent.tools.get("exit_plan_mode").is_some());
+    assert!(agent.config.plan_mode.enabled);
+}
+
+#[test]
+fn test_builder_with_default_subagents_registers_all_built_ins() {
+    let provider = MockProvider::new(vec![]);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .with_default_subagents(ToolRegistry::new(), ToolRegistry::new())
+        .build();
+
+    assert!(agent.tools.get("subagent_explore").is_some());
+    assert!(agent.tools.get("subagent_plan").is_some());
+    assert!(agent.tools.get("subagent_verification").is_some());
+    assert!(agent.tools.get("subagent_code_review").is_some());
+    assert!(agent.tools.get("subagent_general_purpose").is_some());
+}
+
+#[test]
+fn test_builder_with_claude_code_presets_registers_bundle() {
+    let provider = MockProvider::new(vec![]);
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .with_claude_code_presets(ToolRegistry::new(), ToolRegistry::new())
+        .build();
+
+    assert!(agent.tools.get("task").is_some());
+    assert!(agent.tools.get("subagent_explore").is_some());
+    assert!(agent.tools.get("subagent_code_review").is_some());
+    assert!(agent.tools.get("enter_plan_mode").is_some());
+    assert!(agent.tools.get("exit_plan_mode").is_some());
+    assert!(agent.config.memory.enabled);
+}
+
+#[test]
+fn test_builder_with_skill_layers_skill_on_default_prompt() {
+    let provider = MockProvider::new(vec![]);
+    let skill = Skill::new("research", "You are a focused research assistant.");
+
+    let agent = builder::<()>().provider(provider).with_skill(skill).build();
+
+    assert!(agent.config.system_prompt.contains("# System"));
+    assert!(
+        agent
+            .config
+            .system_prompt
+            .contains("You are a focused research assistant.")
+    );
+}
+
+#[test]
 fn test_builder_with_custom_stores() {
     let provider = MockProvider::new(vec![]);
     let message_store = InMemoryStore::new();
@@ -68,6 +201,325 @@ fn test_builder_with_custom_stores() {
 
     // Just verify it builds without panicking
     assert_eq!(agent.config.max_turns, None);
+}
+
+#[tokio::test]
+async fn test_plan_mode_blocks_non_allowlisted_tool() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "inspect", json!({"message": "check"})),
+        MockProvider::text_response("planning done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(PlanInspectTool);
+    let config = AgentConfig::default().with_plan_mode();
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .config(config)
+        .build();
+
+    let (rx, _state) = agent.run(
+        ThreadId::new(),
+        AgentInput::Text("Plan this change".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let events = drain_events(rx).await;
+
+    let blocked = events.iter().find_map(|event| match &event.event {
+        AgentEvent::ToolCallEnd { result, .. } => Some(result.output.clone()),
+        _ => None,
+    });
+
+    assert!(blocked.is_some());
+    assert!(blocked.unwrap().contains("not allowed in plan mode"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plan_mode_allows_allowlisted_tool() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response("tool_1", "inspect", json!({"message": "check"})),
+        MockProvider::text_response("planning done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(PlanInspectTool);
+    let config = AgentConfig::default().with_plan_mode_config(
+        PlanModeConfig::enabled().with_additional_allowed_tools(vec!["inspect".to_string()]),
+    );
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .config(config)
+        .build();
+
+    let (rx, _state) = agent.run(
+        ThreadId::new(),
+        AgentInput::Text("Plan this change".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let events = drain_events(rx).await;
+
+    let result = events.iter().find_map(|event| match &event.event {
+        AgentEvent::ToolCallEnd { result, .. } => Some(result.clone()),
+        _ => None,
+    });
+
+    assert!(result.is_some());
+    let result = result.unwrap();
+    assert!(result.success);
+    assert!(result.output.contains("Plan inspect: check"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_enter_plan_mode_blocks_later_tool_in_same_turn() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_uses_response(vec![
+            ("tool_1", "enter_plan_mode", json!({})),
+            ("tool_2", "inspect", json!({"message": "check"})),
+        ]),
+        MockProvider::text_response("planning done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(EnterPlanModeTool);
+    tools.register(PlanInspectTool);
+
+    let agent = builder::<()>().provider(provider).tools(tools).build();
+
+    let (rx, _state) = agent.run(
+        ThreadId::new(),
+        AgentInput::Text("Switch to plan mode".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let events = drain_events(rx).await;
+
+    let inspect_result = events.iter().find_map(|event| match &event.event {
+        AgentEvent::ToolCallEnd { name, result, .. } if name == "inspect" => {
+            Some(result.output.clone())
+        }
+        _ => None,
+    });
+
+    assert!(inspect_result.is_some());
+    assert!(inspect_result.unwrap().contains("not allowed in plan mode"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_exit_plan_mode_confirmation_disables_mode_and_records_plan() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response(
+            "tool_1",
+            "exit_plan_mode",
+            json!({"plan": "1. Update parser\n2. Add tests"}),
+        ),
+        MockProvider::text_response("Implementing approved plan"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(ExitPlanModeTool);
+    let message_store = InMemoryStore::new();
+    let state_store = InMemoryStore::new();
+    let config = AgentConfig::default().with_plan_mode();
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(DefaultHooks)
+        .message_store(message_store)
+        .state_store(state_store)
+        .config(config)
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let (_events_1, outcome_rx_1) = agent.run_turn(
+        thread_id.clone(),
+        AgentInput::Text("Finalize the plan".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let outcome_1 = outcome_rx_1.await?;
+
+    let (continuation, tool_call_id) = match outcome_1 {
+        TurnOutcome::AwaitingConfirmation {
+            continuation,
+            tool_call_id,
+            ..
+        } => (continuation, tool_call_id),
+        other => panic!("Expected AwaitingConfirmation, got {other:?}"),
+    };
+
+    let (_events_2, outcome_rx_2) = agent.run_turn(
+        thread_id.clone(),
+        AgentInput::Resume {
+            continuation,
+            tool_call_id,
+            confirmed: true,
+            rejection_reason: None,
+        },
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let outcome_2 = outcome_rx_2.await?;
+    assert!(matches!(outcome_2, TurnOutcome::NeedsMoreTurns { .. }));
+
+    let stored_state = agent.state_store.load(&thread_id).await?.expect("state");
+    assert!(!stored_state.plan_mode_enabled());
+    assert_eq!(
+        stored_state.metadata.get(METADATA_LAST_APPROVED_PLAN),
+        Some(&serde_json::Value::String(
+            "1. Update parser\n2. Add tests".to_string()
+        ))
+    );
+
+    let history = agent.message_store.get_history(&thread_id).await?;
+    let plan_text_present = history.iter().any(|message| match &message.content {
+        Content::Blocks(blocks) => blocks.iter().any(|block| match block {
+            ContentBlock::Text { text } => text.contains("Approved plan:"),
+            _ => false,
+        }),
+        _ => false,
+    });
+    assert!(plan_text_present);
+
+    let (_events_3, outcome_rx_3) = agent.run_turn(
+        thread_id,
+        AgentInput::Continue,
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let outcome_3 = outcome_rx_3.await?;
+    assert!(matches!(outcome_3, TurnOutcome::Done { .. }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_exit_plan_mode_rejection_keeps_mode_and_records_feedback() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![
+        MockProvider::tool_use_response(
+            "tool_1",
+            "exit_plan_mode",
+            json!({"plan": "1. Update parser\n2. Add tests"}),
+        ),
+        MockProvider::text_response("Revising the plan"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(ExitPlanModeTool);
+    let message_store = InMemoryStore::new();
+    let state_store = InMemoryStore::new();
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .tools(tools)
+        .hooks(DefaultHooks)
+        .message_store(message_store)
+        .state_store(state_store)
+        .config(AgentConfig::default().with_plan_mode())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let (_events_1, outcome_rx_1) = agent.run_turn(
+        thread_id.clone(),
+        AgentInput::Text("Finalize the plan".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let outcome_1 = outcome_rx_1.await?;
+
+    let (continuation, tool_call_id) = match outcome_1 {
+        TurnOutcome::AwaitingConfirmation {
+            continuation,
+            tool_call_id,
+            ..
+        } => (continuation, tool_call_id),
+        other => panic!("Expected AwaitingConfirmation, got {other:?}"),
+    };
+
+    let (_events_2, outcome_rx_2) = agent.run_turn(
+        thread_id.clone(),
+        AgentInput::Resume {
+            continuation,
+            tool_call_id,
+            confirmed: false,
+            rejection_reason: Some("Need rollback strategy".to_string()),
+        },
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let outcome_2 = outcome_rx_2.await?;
+    assert!(matches!(outcome_2, TurnOutcome::NeedsMoreTurns { .. }));
+
+    let stored_state = agent.state_store.load(&thread_id).await?.expect("state");
+    assert!(stored_state.plan_mode_enabled());
+    let artifact = stored_state.plan_artifact().expect("artifact");
+    assert_eq!(
+        artifact.current_plan,
+        Some("1. Update parser\n2. Add tests".to_string())
+    );
+    assert_eq!(
+        artifact.latest_feedback,
+        Some("Need rollback strategy".to_string())
+    );
+
+    let history = agent.message_store.get_history(&thread_id).await?;
+    let rejection_text_present = history.iter().any(|message| match &message.content {
+        Content::Blocks(blocks) => blocks.iter().any(|block| match block {
+            ContentBlock::Text { text } => text.contains("was not approved"),
+            _ => false,
+        }),
+        _ => false,
+    });
+    assert!(rejection_text_present);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plan_mode_plain_text_turn_gets_reminder_and_continues() -> anyhow::Result<()> {
+    let provider = MockProvider::new(vec![MockProvider::text_response(
+        "Here is a draft plan in prose only.",
+    )]);
+    let message_store = InMemoryStore::new();
+    let state_store = InMemoryStore::new();
+
+    let agent = builder::<()>()
+        .provider(provider)
+        .hooks(DefaultHooks)
+        .message_store(message_store)
+        .state_store(state_store)
+        .config(AgentConfig::default().with_plan_mode())
+        .build_with_stores();
+    let thread_id = ThreadId::new();
+
+    let (_events, outcome_rx) = agent.run_turn(
+        thread_id.clone(),
+        AgentInput::Text("Plan this change".to_string()),
+        ToolContext::new(()),
+        CancellationToken::new(),
+    );
+    let outcome = outcome_rx.await?;
+    assert!(matches!(outcome, TurnOutcome::NeedsMoreTurns { .. }));
+
+    let stored_state = agent.state_store.load(&thread_id).await?.expect("state");
+    assert_eq!(stored_state.plan_mode_discipline_retries(), 1);
+
+    let history = agent.message_store.get_history(&thread_id).await?;
+    let reminder_present = history.iter().any(|message| match &message.content {
+        Content::Text(text) => text.contains("<system-reminder>Plan mode is still active"),
+        Content::Blocks(blocks) => blocks.iter().any(|block| match block {
+            ContentBlock::Text { text } => {
+                text.contains("<system-reminder>Plan mode is still active")
+            }
+            _ => false,
+        }),
+    });
+    assert!(reminder_present);
+
+    Ok(())
 }
 
 // ===================

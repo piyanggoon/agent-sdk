@@ -1,8 +1,11 @@
 use crate::context::{CompactionConfig, ContextCompactor};
 use crate::hooks::{AgentHooks, DefaultHooks};
 use crate::llm::LlmProvider;
+use crate::plan_mode::register_default_plan_mode_tools;
+use crate::prompts::ensure_default_system_prompt;
 use crate::skills::Skill;
 use crate::stores::{InMemoryStore, MessageStore, StateStore, ToolExecutionStore};
+use crate::subagent::{SubagentFactory, TaskTool};
 use crate::tools::ToolRegistry;
 use crate::types::AgentConfig;
 use std::sync::Arc;
@@ -256,12 +259,122 @@ impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S> {
         // Merge system prompt
         let mut config = self.config.take().unwrap_or_default();
         if config.system_prompt.is_empty() {
-            config.system_prompt = skill.system_prompt;
+            ensure_default_system_prompt(
+                &mut config.system_prompt,
+                self.tools.as_ref(),
+                self.compaction_config.is_some() || self.compactor.is_some(),
+                config.plan_mode.enabled,
+            );
+            if !skill.system_prompt.is_empty() {
+                config.system_prompt =
+                    format!("{}\n\n{}", config.system_prompt, skill.system_prompt);
+            }
         } else {
             config.system_prompt = format!("{}\n\n{}", config.system_prompt, skill.system_prompt);
         }
         self.config = Some(config);
 
+        self
+    }
+}
+
+impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S>
+where
+    Ctx: Send + Sync + 'static,
+    P: LlmProvider + Clone + 'static,
+{
+    /// Register the SDK's built-in subagent tools.
+    #[must_use]
+    pub fn with_default_subagents(
+        mut self,
+        read_only_registry: ToolRegistry<()>,
+        full_registry: ToolRegistry<()>,
+    ) -> Self {
+        let provider = self
+            .provider
+            .as_ref()
+            .expect("provider must be set before registering default subagents")
+            .clone();
+        let factory = SubagentFactory::new(Arc::new(provider))
+            .with_read_only_registry(read_only_registry)
+            .with_full_registry(full_registry);
+
+        let mut tools = self.tools.take().unwrap_or_default();
+        factory
+            .register_default_subagents(&mut tools)
+            .expect("default subagent registries must be configured");
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Register the first-class resumable task tool.
+    #[must_use]
+    pub fn with_task_tool(
+        mut self,
+        read_only_registry: ToolRegistry<()>,
+        full_registry: ToolRegistry<()>,
+    ) -> Self {
+        let provider = self
+            .provider
+            .as_ref()
+            .expect("provider must be set before registering the task tool")
+            .clone();
+
+        let mut tools = self.tools.take().unwrap_or_default();
+        tools.register(TaskTool::new(
+            Arc::new(provider),
+            Arc::new(read_only_registry),
+            Arc::new(full_registry),
+        ));
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Apply a Claude Code-style preset bundle.
+    #[must_use]
+    pub fn with_claude_code_presets(
+        mut self,
+        read_only_registry: ToolRegistry<()>,
+        full_registry: ToolRegistry<()>,
+    ) -> Self {
+        self = self.with_default_subagents(read_only_registry.clone(), full_registry.clone());
+        self = self.with_task_tool(read_only_registry, full_registry);
+        self = self.with_default_plan_mode_tools();
+
+        let mut config = self.config.take().unwrap_or_default();
+        config.memory.enabled = true;
+        if config.memory.max_memories == 0 {
+            config.memory.max_memories = 12;
+        }
+        self.config = Some(config);
+        self
+    }
+}
+
+impl<Ctx, P, H, M, S> AgentLoopBuilder<Ctx, P, H, M, S>
+where
+    Ctx: Send + Sync + 'static,
+{
+    /// Register the SDK's built-in plan mode tools.
+    #[must_use]
+    pub fn with_default_plan_mode_tools(mut self) -> Self {
+        let mut tools = self.tools.take().unwrap_or_default();
+        register_default_plan_mode_tools(&mut tools);
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Apply the default plan mode preset.
+    ///
+    /// This registers the built-in plan mode tools and enables plan mode in the
+    /// agent configuration while preserving any existing additional allowlist.
+    #[must_use]
+    pub fn with_plan_mode_preset(mut self) -> Self {
+        self = self.with_default_plan_mode_tools();
+
+        let mut config = self.config.take().unwrap_or_default();
+        config.plan_mode.enabled = true;
+        self.config = Some(config);
         self
     }
 }
@@ -286,7 +399,13 @@ where
     pub fn build(self) -> AgentLoop<Ctx, P, DefaultHooks, InMemoryStore, InMemoryStore> {
         let provider = self.provider.expect("provider is required");
         let tools = self.tools.unwrap_or_default();
-        let config = self.config.unwrap_or_default();
+        let mut config = self.config.unwrap_or_default();
+        ensure_default_system_prompt(
+            &mut config.system_prompt,
+            Some(&tools),
+            self.compaction_config.is_some() || self.compactor.is_some(),
+            config.plan_mode.enabled,
+        );
 
         AgentLoop {
             provider: Arc::new(provider),
@@ -334,7 +453,13 @@ where
         let state_store = self
             .state_store
             .expect("state_store is required when using build_with_stores");
-        let config = self.config.unwrap_or_default();
+        let mut config = self.config.unwrap_or_default();
+        ensure_default_system_prompt(
+            &mut config.system_prompt,
+            Some(&tools),
+            self.compaction_config.is_some() || self.compactor.is_some(),
+            config.plan_mode.enabled,
+        );
 
         AgentLoop {
             provider: Arc::new(provider),

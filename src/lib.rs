@@ -329,8 +329,12 @@ mod filesystem;
 mod hooks;
 pub mod llm;
 pub mod mcp;
+pub mod memory;
 pub mod model_capabilities;
+pub mod plan_mode;
+pub mod preset_prompts;
 pub mod primitive_tools;
+mod prompts;
 pub mod providers;
 pub mod reminders;
 pub mod skills;
@@ -359,6 +363,7 @@ pub use filesystem::{InMemoryFileSystem, LocalFileSystem};
 // Re-export CancellationToken for use with `AgentLoop::run_with_cancel`.
 pub use hooks::{AgentHooks, AllowAllHooks, DefaultHooks, LoggingHooks, ToolDecision};
 pub use llm::{ContentBlock, ContentSource, Effort, LlmProvider, ThinkingConfig, ThinkingMode};
+pub use memory::{MemoryConfig, MemoryKind, MemoryNote};
 pub use model_capabilities::{
     ModelCapabilities, PricePoint, Pricing, SourceStatus, get_model_capabilities,
     supported_model_capabilities,
@@ -368,10 +373,10 @@ pub use stores::{
 };
 pub use tokio_util::sync::CancellationToken;
 pub use tools::{
-    AsyncTool, DynamicToolName, ErasedAsyncTool, ErasedListenTool, ErasedTool, ErasedToolStatus,
-    ListenExecuteTool, ListenStopReason, ListenToolUpdate, PrimitiveToolName, ProgressStage, Tool,
-    ToolContext, ToolName, ToolRegistry, ToolStatus, stage_to_string, tool_name_from_str,
-    tool_name_to_string,
+    AsyncTool, DynamicToolName, EnvironmentDetails, ErasedAsyncTool, ErasedListenTool, ErasedTool,
+    ErasedToolStatus, ListenExecuteTool, ListenStopReason, ListenToolUpdate, PlanModePolicy,
+    PrimitiveToolName, ProgressStage, Tool, ToolContext, ToolName, ToolRegistry, ToolStatus,
+    stage_to_string, tool_name_from_str, tool_name_to_string,
 };
 pub use types::{
     AgentConfig, AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState,
@@ -387,14 +392,19 @@ pub use user_interaction::{
 
 // Re-export subagent types for convenience
 pub use subagent::{
-    METADATA_MAX_SUBAGENT_DEPTH, METADATA_SUBAGENT_DEPTH, SubagentConfig, SubagentFactory,
-    SubagentTool,
+    BuiltInSubagent, METADATA_MAX_SUBAGENT_DEPTH, METADATA_SUBAGENT_DEPTH, SubagentConfig,
+    SubagentFactory, SubagentTool, TaskTool, built_in_subagent_config,
 };
 
 // Re-export todo types for convenience
 pub use todo::{TodoItem, TodoReadTool, TodoState, TodoStatus, TodoWriteTool};
 
 // Re-export reminder types for convenience
+pub use plan_mode::{
+    EnterPlanModeTool, ExitPlanModeTool, PlanArtifact, PlanArtifactStatus, PlanModeConfig,
+    register_default_plan_mode_tools,
+};
 pub use reminders::{
     ReminderConfig, ReminderTracker, ReminderTrigger, ToolReminder, append_reminder, wrap_reminder,
 };
+pub use skills::{BuiltInSkill, built_in_skill, built_in_skills};

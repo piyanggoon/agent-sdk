@@ -20,7 +20,7 @@ use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::{PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
+use crate::{PlanModePolicy, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -283,12 +283,7 @@ impl<Ctx: Send + Sync + 'static> Tool<Ctx> for TodoWriteTool {
     }
 
     fn description(&self) -> &'static str {
-        "Update the TODO list to track tasks and show progress to the user. \
-         Use this tool frequently to plan complex tasks and mark progress. \
-         Each item needs 'content' (imperative form like 'Fix the bug'), \
-         'status' (pending/in_progress/completed), and 'activeForm' \
-         (present continuous like 'Fixing the bug'). \
-         Mark tasks completed immediately when done - don't batch completions."
+        "Update the TODO list to track task status and show progress to the user.\n\nUse this tool proactively for multi-step, non-trivial, or multi-part work. Skip it for simple one-step tasks or purely conversational requests.\n\nEach item must include `content` (imperative form like 'Fix the bug'), `status` (pending/in_progress/completed), and `activeForm` (present continuous like 'Fixing the bug'). Keep exactly one task in progress, mark tasks completed as soon as they are done, and do not mark work complete while it is still blocked or partially implemented."
     }
 
     fn input_schema(&self) -> Value {
@@ -325,6 +320,10 @@ impl<Ctx: Send + Sync + 'static> Tool<Ctx> for TodoWriteTool {
 
     fn tier(&self) -> ToolTier {
         ToolTier::Observe // No dangerous side effects
+    }
+
+    fn plan_mode_policy(&self) -> PlanModePolicy {
+        PlanModePolicy::Allowed
     }
 
     async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
@@ -397,6 +396,10 @@ impl<Ctx: Send + Sync + 'static> Tool<Ctx> for TodoReadTool {
 
     fn tier(&self) -> ToolTier {
         ToolTier::Observe
+    }
+
+    fn plan_mode_policy(&self) -> PlanModePolicy {
+        PlanModePolicy::Allowed
     }
 
     async fn execute(&self, _ctx: &ToolContext<Ctx>, _input: Value) -> Result<ToolResult> {

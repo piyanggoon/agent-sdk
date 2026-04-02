@@ -1,6 +1,6 @@
 //! Web search tool implementation.
 
-use crate::tools::{PrimitiveToolName, Tool, ToolContext};
+use crate::tools::{PlanModePolicy, PrimitiveToolName, Tool, ToolContext};
 use crate::types::{ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -119,6 +119,10 @@ where
     fn tier(&self) -> ToolTier {
         // Web search is read-only, so Observe tier
         ToolTier::Observe
+    }
+
+    fn plan_mode_policy(&self) -> PlanModePolicy {
+        PlanModePolicy::Allowed
     }
 
     async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {

@@ -38,7 +38,7 @@ impl<E: Environment + 'static> Tool<()> for WriteTool<E> {
     }
 
     fn description(&self) -> &'static str {
-        "Write content to a file. Creates the file if it doesn't exist, overwrites if it does."
+        "Write content to a file. Creates the file if it does not exist and overwrites it if it does.\n\nUsage notes:\n- Prefer edit when you only need to change part of an existing file.\n- Use write when creating a new file or replacing the full contents is the simplest correct approach."
     }
 
     fn tier(&self) -> ToolTier {

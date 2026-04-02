@@ -14,6 +14,12 @@ use crate::hooks::AgentHooks;
 use crate::llm::{
     ChatRequest, ChatResponse, Content, ContentBlock, LlmProvider, Message, StopReason,
 };
+use crate::memory::memory_prompt_suffix;
+use crate::plan_mode::{
+    apply_pending_confirmation_to_state, apply_tool_results_to_state, discipline_reminder_message,
+    runtime_system_prompt_suffix,
+};
+use crate::prompts::runtime_environment_prompt_suffix;
 use crate::stores::{MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{
@@ -378,6 +384,8 @@ pub(super) fn build_turn_request<Ctx, P>(
     config: &AgentConfig,
     provider: &Arc<P>,
     thread_id: &ThreadId,
+    state: &crate::types::AgentState,
+    tool_context: &ToolContext<Ctx>,
     messages: Vec<Message>,
     tools: &Arc<ToolRegistry<Ctx>>,
 ) -> Result<ChatRequest, AgentError>
@@ -395,8 +403,22 @@ where
         AgentError::new(format!("Invalid thinking configuration: {error}"), false)
     })?;
 
+    let suffixes = [
+        memory_prompt_suffix(state),
+        runtime_system_prompt_suffix(state),
+        runtime_environment_prompt_suffix(tool_context),
+    ]
+    .into_iter()
+    .filter(|suffix| !suffix.is_empty())
+    .collect::<Vec<_>>();
+    let system = if suffixes.is_empty() {
+        config.system_prompt.clone()
+    } else {
+        format!("{}\n\n{}", config.system_prompt, suffixes.join("\n\n"))
+    };
+
     Ok(ChatRequest {
-        system: config.system_prompt.clone(),
+        system,
         messages,
         tools: llm_tools,
         max_tokens: config
@@ -749,19 +771,23 @@ where
 {
     let mut pending_tool_calls = pending_tool_calls;
     let mut tool_results = Vec::new();
-    let execution_ctx = ToolCallExecutionContext {
-        tool_context,
-        thread_id,
-        tools,
-        hooks,
-        tx,
-        seq,
-        execution_store,
-    };
+    let mut live_tool_context = tool_context.clone();
 
     for pending in pending_tool_calls.clone() {
+        let execution_ctx = ToolCallExecutionContext {
+            tool_context: &live_tool_context,
+            thread_id,
+            tools,
+            hooks,
+            tx,
+            seq,
+            execution_store,
+        };
         match execute_tool_call(&pending, &execution_ctx).await {
             ToolExecutionOutcome::Completed { tool_id, result } => {
+                apply_tool_results_to_state(state, &[(tool_id.clone(), result.clone())]);
+                live_tool_context
+                    .set_plan_mode(state.plan_mode_enabled(), state.plan_mode_allowed_tools());
                 tool_results.push((tool_id, result));
             }
             ToolExecutionOutcome::RequiresConfirmation {
@@ -779,6 +805,7 @@ where
                 if let Some(context) = listen_context {
                     pending_tool_calls[pending_idx].listen_context = Some(context);
                 }
+                apply_pending_confirmation_to_state(state, &tool_name, &input);
 
                 let continuation = AgentContinuation {
                     thread_id: thread_id.clone(),
@@ -788,7 +815,7 @@ where
                     pending_tool_calls: pending_tool_calls.clone(),
                     awaiting_index: pending_idx,
                     completed_results: tool_results,
-                    state: state.clone(),
+                    state: (*state).clone(),
                 };
 
                 return Err(InternalTurnResult::AwaitingConfirmation {
@@ -971,10 +998,40 @@ where
 {
     match stop_reason {
         Some(StopReason::EndTurn) => {
+            if ctx.state.plan_mode_enabled() && !had_tool_calls {
+                let reminder_retries = ctx.state.increment_plan_mode_discipline_retries();
+                if reminder_retries > 2 {
+                    return InternalTurnResult::Error(AgentError::new(
+                        "Plan mode stayed active without `ask_user` or `exit_plan_mode` after repeated reminders. Either request clarification or submit the final plan for approval."
+                            .to_string(),
+                        false,
+                    ));
+                }
+
+                if let Some(reminder) = discipline_reminder_message(&ctx.state) {
+                    if let Err(error) = message_store
+                        .append(&ctx.thread_id, Message::user(reminder))
+                        .await
+                    {
+                        return InternalTurnResult::Error(AgentError::new(
+                            format!("Failed to append plan mode reminder: {error}"),
+                            false,
+                        ));
+                    }
+                }
+
+                info!(
+                    "Plan mode remained active without a planning tool action; continuing with reminder (turn={})",
+                    ctx.turn
+                );
+                return InternalTurnResult::Continue { turn_usage };
+            }
+
             info!("Agent completed (end_turn) (turn={})", ctx.turn);
             InternalTurnResult::Done
         }
         Some(StopReason::ToolUse) => {
+            ctx.state.reset_plan_mode_discipline_retries();
             debug!("Tool use stop (turn={})", ctx.turn);
             InternalTurnResult::Continue { turn_usage }
         }
@@ -994,6 +1051,7 @@ where
         }
         Some(StopReason::MaxTokens) => {
             if had_tool_calls {
+                ctx.state.reset_plan_mode_discipline_retries();
                 // Tool calls were executed and their results appended as a user
                 // message, so message alternation is preserved. Safe to continue.
                 warn!(
@@ -1057,6 +1115,7 @@ where
             // Unknown/missing stop reason. Only continue if tool results were
             // appended (preserving message alternation).
             if had_tool_calls {
+                ctx.state.reset_plan_mode_discipline_retries();
                 warn!(
                     "No stop reason with tool calls (turn={}), continuing",
                     ctx.turn
@@ -1251,7 +1310,15 @@ where
         Err(error) => return InternalTurnResult::Error(error),
     };
 
-    let request = match build_turn_request(config, provider, &ctx.thread_id, messages, tools) {
+    let request = match build_turn_request(
+        config,
+        provider,
+        &ctx.thread_id,
+        &ctx.state,
+        tool_context,
+        messages,
+        tools,
+    ) {
         Ok(request) => request,
         Err(error) => return InternalTurnResult::Error(error),
     };
@@ -1375,7 +1442,7 @@ where
         turn: ctx.turn,
         total_usage: &ctx.total_usage,
         turn_usage: &turn_usage,
-        state: &ctx.state,
+        state: &mut ctx.state,
         message_store,
     })
     .await

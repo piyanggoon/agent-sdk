@@ -1,4 +1,6 @@
-use crate::{Environment, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
+use crate::{
+    Environment, PlanModePolicy, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier,
+};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -51,11 +53,15 @@ impl<E: Environment + 'static> Tool<()> for GrepTool<E> {
     }
 
     fn description(&self) -> &'static str {
-        "Search for a regex pattern in files. Returns matching lines with file paths and line numbers."
+        "Search file contents using a regex pattern. Returns matching lines with file paths and line numbers.\n\nUsage notes:\n- Use this for content search instead of shell grep when the dedicated tool is available.\n- Narrow the path when you already know where to search.\n- Use case_insensitive when needed rather than changing the pattern manually."
     }
 
     fn tier(&self) -> ToolTier {
         ToolTier::Observe
+    }
+
+    fn plan_mode_policy(&self) -> PlanModePolicy {
+        PlanModePolicy::Allowed
     }
 
     fn input_schema(&self) -> Value {

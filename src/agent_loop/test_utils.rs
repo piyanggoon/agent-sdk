@@ -5,6 +5,7 @@ use crate::types::{ToolResult, ToolTier};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
+use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -12,16 +13,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // Mock LLM Provider
 // ===================
 
+#[derive(Clone)]
 pub struct MockProvider {
-    responses: RwLock<Vec<ChatOutcome>>,
-    call_count: AtomicUsize,
+    responses: Arc<RwLock<Vec<ChatOutcome>>>,
+    call_count: Arc<AtomicUsize>,
 }
 
 impl MockProvider {
     pub fn new(responses: Vec<ChatOutcome>) -> Self {
         Self {
-            responses: RwLock::new(responses),
-            call_count: AtomicUsize::new(0),
+            responses: Arc::new(RwLock::new(responses)),
+            call_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 

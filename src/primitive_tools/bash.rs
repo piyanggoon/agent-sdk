@@ -51,7 +51,7 @@ impl<E: Environment + 'static> Tool<()> for BashTool<E> {
     }
 
     fn description(&self) -> &'static str {
-        "Execute a shell command. Use for git, npm, cargo, and other CLI tools. Returns stdout, stderr, and exit code."
+        "Execute a shell command for terminal-oriented work such as git, cargo, npm, docker, or gh. Returns stdout, stderr, and exit code.\n\nUsage notes:\n- Prefer dedicated tools like read, edit, write, glob, and grep when they fit the task.\n- Use bash when the shell is the natural interface for the operation.\n- Diagnose failures before retrying with a different command.\n- If you need multiple independent shell commands, issue them as separate tool calls in one response."
     }
 
     fn tier(&self) -> ToolTier {

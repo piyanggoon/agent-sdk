@@ -11,6 +11,11 @@ use super::types::{
 use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 use crate::hooks::AgentHooks;
 use crate::llm::{Content, ContentBlock, LlmProvider, Message, Role};
+use crate::memory::update_memories_from_user_text;
+use crate::plan_mode::{
+    PlanArtifact, apply_pending_confirmation_to_state, apply_tool_results_to_state,
+    ensure_plan_mode_artifact,
+};
 use crate::stores::{MessageStore, StateStore};
 use crate::types::{
     AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState, ThreadId, TokenUsage,
@@ -20,6 +25,34 @@ use log::warn;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
+
+fn apply_plan_mode_to_state(config: &crate::types::AgentConfig, state: &mut AgentState) {
+    let enabled = if state
+        .metadata
+        .contains_key(crate::plan_mode::METADATA_PLAN_MODE_ENABLED)
+    {
+        state.plan_mode_enabled()
+    } else {
+        config.plan_mode.enabled
+    };
+    state.set_plan_mode_enabled(enabled);
+
+    let mut allowed_tools = state.plan_mode_allowed_tools();
+    for tool in &config.plan_mode.additional_allowed_tools {
+        if !allowed_tools.iter().any(|existing| existing == tool) {
+            allowed_tools.push(tool.clone());
+        }
+    }
+    state.set_plan_mode_allowed_tools(allowed_tools);
+
+    if state.plan_mode_enabled() {
+        ensure_plan_mode_artifact(state);
+    } else if state.plan_artifact().is_none()
+        && let Some(approved_plan) = state.approved_plan()
+    {
+        state.set_plan_artifact(PlanArtifact::draft().approved(approved_plan));
+    }
+}
 
 /// Initialize agent state from the given input.
 ///
@@ -32,6 +65,7 @@ pub(super) async fn initialize_from_input<M, S>(
     thread_id: &ThreadId,
     message_store: &Arc<M>,
     state_store: &Arc<S>,
+    memory_config: &crate::memory::MemoryConfig,
 ) -> Result<InitializedState, AgentError>
 where
     M: MessageStore,
@@ -59,6 +93,9 @@ where
                     false,
                 ));
             }
+
+            let mut state = state;
+            update_memories_from_user_text(&mut state, memory_config, &user_message);
 
             Ok(InitializedState {
                 turn: 0,
@@ -207,10 +244,11 @@ where
     let awaiting_tool = &cont.pending_tool_calls[cont.awaiting_index];
 
     let mut tool_results = cont.completed_results.clone();
+    let mut live_tool_context = tool_context.clone();
     let rejection =
         (!confirmed).then(|| rejection_reason.unwrap_or_else(|| "User rejected".to_string()));
     let confirmed_ctx = ConfirmedToolExecutionContext {
-        tool_context,
+        tool_context: &live_tool_context,
         thread_id,
         tools,
         hooks,
@@ -219,21 +257,25 @@ where
         execution_store,
     };
     let result = execute_confirmed_tool(awaiting_tool, rejection, &confirmed_ctx).await;
+    apply_tool_results_to_state(state, &[(awaiting_tool.id.clone(), result.clone())]);
+    live_tool_context.set_plan_mode(state.plan_mode_enabled(), state.plan_mode_allowed_tools());
     tool_results.push((awaiting_tool.id.clone(), result));
 
-    let execution_ctx = ToolCallExecutionContext {
-        tool_context,
-        thread_id,
-        tools,
-        hooks,
-        tx,
-        seq,
-        execution_store,
-    };
-
     for pending in cont.pending_tool_calls.iter().skip(cont.awaiting_index + 1) {
+        let execution_ctx = ToolCallExecutionContext {
+            tool_context: &live_tool_context,
+            thread_id,
+            tools,
+            hooks,
+            tx,
+            seq,
+            execution_store,
+        };
         match execute_tool_call(pending, &execution_ctx).await {
             ToolExecutionOutcome::Completed { tool_id, result } => {
+                apply_tool_results_to_state(state, &[(tool_id.clone(), result.clone())]);
+                live_tool_context
+                    .set_plan_mode(state.plan_mode_enabled(), state.plan_mode_allowed_tools());
                 tool_results.push((tool_id, result));
             }
             ToolExecutionOutcome::RequiresConfirmation {
@@ -249,6 +291,7 @@ where
                 if let Some(context) = listen_context {
                     pending_tool_calls[pending_idx].listen_context = Some(context);
                 }
+                apply_pending_confirmation_to_state(state, &tool_name, &input);
 
                 return Ok(ResumeProcessingResult::AwaitingConfirmation {
                     tool_call_id: tool_id,
@@ -264,7 +307,7 @@ where
                         pending_tool_calls,
                         awaiting_index: pending_idx,
                         completed_results: tool_results,
-                        state: state.clone(),
+                        state: (*state).clone(),
                     }),
                 });
             }
@@ -508,11 +551,12 @@ where
     M: MessageStore,
     S: StateStore,
 {
+    let mut state = state;
     let resume_result = process_resume(ResumeProcessingParameters {
         resume_data,
         turn,
         total_usage: &total_usage,
-        state: &state,
+        state: &mut state,
         thread_id: &thread_id,
         tool_context: &tool_context,
         tools: &tools,
@@ -742,25 +786,36 @@ where
         .with_event_tx(tx.clone(), seq.clone())
         .with_cancel_token(cancel_token.clone());
     let start_time = Instant::now();
-    let init_state =
-        match initialize_from_input(input, &thread_id, &message_store, &state_store).await {
-            Ok(state) => state,
-            Err(error) => return AgentRunState::Error(error),
-        };
+    let init_state = match initialize_from_input(
+        input,
+        &thread_id,
+        &message_store,
+        &state_store,
+        &config.memory,
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(error) => return AgentRunState::Error(error),
+    };
 
     let InitializedState {
         turn,
         total_usage,
-        state,
+        mut state,
         resume_data,
     } = init_state;
+
+    apply_plan_mode_to_state(&config, &mut state);
+    let tool_context =
+        tool_context.with_plan_mode(state.plan_mode_enabled(), state.plan_mode_allowed_tools());
 
     if let Some(resume_data) = resume_data {
         let resume_result = handle_run_loop_resume(RunLoopResumeParams {
             resume_data,
             turn,
             total_usage: &total_usage,
-            state: &state,
+            state: &mut state,
             thread_id: &thread_id,
             tool_context: &tool_context,
             tools: &tools,
@@ -956,27 +1011,38 @@ where
         .with_event_tx(tx.clone(), seq.clone())
         .with_cancel_token(cancel_token.clone());
     let start_time = Instant::now();
-    let init_state =
-        match initialize_from_input(input, &thread_id, &message_store, &state_store).await {
-            Ok(state) => state,
-            Err(error) => {
-                send_event(
-                    &tx,
-                    &hooks,
-                    &seq,
-                    AgentEvent::error(&error.message, error.recoverable),
-                )
-                .await;
-                return TurnOutcome::Error(error);
-            }
-        };
+    let init_state = match initialize_from_input(
+        input,
+        &thread_id,
+        &message_store,
+        &state_store,
+        &config.memory,
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(error) => {
+            send_event(
+                &tx,
+                &hooks,
+                &seq,
+                AgentEvent::error(&error.message, error.recoverable),
+            )
+            .await;
+            return TurnOutcome::Error(error);
+        }
+    };
 
     let InitializedState {
         turn,
         total_usage,
-        state,
+        mut state,
         resume_data,
     } = init_state;
+
+    apply_plan_mode_to_state(&config, &mut state);
+    let tool_context =
+        tool_context.with_plan_mode(state.plan_mode_enabled(), state.plan_mode_allowed_tools());
 
     if let Some(resume_data) = resume_data {
         return handle_single_turn_resume(SingleTurnResumeParams {

@@ -165,7 +165,7 @@ pub(super) struct ResumeProcessingParameters<'a, Ctx, H, M> {
     pub(super) resume_data: ResumeData,
     pub(super) turn: usize,
     pub(super) total_usage: &'a TokenUsage,
-    pub(super) state: &'a AgentState,
+    pub(super) state: &'a mut AgentState,
     pub(super) thread_id: &'a ThreadId,
     pub(super) tool_context: &'a ToolContext<Ctx>,
     pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
@@ -180,7 +180,7 @@ pub(super) struct RunLoopResumeParams<'a, Ctx, H, M> {
     pub(super) resume_data: ResumeData,
     pub(super) turn: usize,
     pub(super) total_usage: &'a TokenUsage,
-    pub(super) state: &'a AgentState,
+    pub(super) state: &'a mut AgentState,
     pub(super) thread_id: &'a ThreadId,
     pub(super) tool_context: &'a ToolContext<Ctx>,
     pub(super) tools: &'a Arc<ToolRegistry<Ctx>>,
@@ -320,7 +320,7 @@ pub(super) struct ToolBatchExecutionParams<'a, Ctx, H> {
     pub(super) turn: usize,
     pub(super) total_usage: &'a TokenUsage,
     pub(super) turn_usage: &'a TokenUsage,
-    pub(super) state: &'a AgentState,
+    pub(super) state: &'a mut AgentState,
 }
 
 pub(super) struct TurnCompletionParams<'a, H, M> {
@@ -346,7 +346,7 @@ pub(super) struct TurnToolPhaseParams<'a, Ctx, H, M> {
     pub(super) turn: usize,
     pub(super) total_usage: &'a TokenUsage,
     pub(super) turn_usage: &'a TokenUsage,
-    pub(super) state: &'a AgentState,
+    pub(super) state: &'a mut AgentState,
     pub(super) message_store: &'a Arc<M>,
 }
 

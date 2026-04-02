@@ -37,7 +37,7 @@
 //! // The UI handles requests and responses through the channels
 //! ```
 
-use crate::{PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
+use crate::{PlanModePolicy, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -309,10 +309,7 @@ impl<Ctx: Send + Sync + 'static> Tool<Ctx> for AskUserQuestionTool {
     }
 
     fn description(&self) -> &'static str {
-        "Ask the user a question to get clarification, preferences, or choices. \
-         Use this when you need user input before proceeding. For yes/no confirmations \
-         of dangerous operations, tool confirmation will be shown automatically - \
-         use this tool for open-ended questions or when offering choices."
+        "Ask the user a question to get clarification, preferences, or choices before proceeding.\n\nUse this for ambiguity, requirement gaps, or implementation decisions that genuinely need the user's input. For dangerous operations, normal tool confirmation is shown automatically; use this tool for open-ended questions or for offering concrete choices. If you recommend a choice, put it first in the options list and label it clearly."
     }
 
     fn input_schema(&self) -> Value {
@@ -357,6 +354,10 @@ impl<Ctx: Send + Sync + 'static> Tool<Ctx> for AskUserQuestionTool {
     fn tier(&self) -> ToolTier {
         // Questions don't modify anything, but they do require user interaction
         ToolTier::Observe
+    }
+
+    fn plan_mode_policy(&self) -> PlanModePolicy {
+        PlanModePolicy::Allowed
     }
 
     async fn execute(&self, _ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {

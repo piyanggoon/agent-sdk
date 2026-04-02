@@ -46,7 +46,7 @@ impl<E: Environment + 'static> Tool<()> for EditTool<E> {
     }
 
     fn description(&self) -> &'static str {
-        "Edit a file by replacing a string. The old_string must match exactly and uniquely (unless replace_all is true)."
+        "Edit a file by exact string replacement. The old_string must match exactly and uniquely unless replace_all is true.\n\nUsage notes:\n- Read the file first so you can match the exact text and indentation.\n- Use the smallest clearly unique block for old_string rather than a huge chunk of surrounding context.\n- Prefer editing an existing file instead of rewriting the whole file when a focused replacement is enough."
     }
 
     fn tier(&self) -> ToolTier {

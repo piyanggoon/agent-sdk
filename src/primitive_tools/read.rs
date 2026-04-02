@@ -1,5 +1,7 @@
 use crate::llm::ContentSource;
-use crate::{Environment, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier};
+use crate::{
+    Environment, PlanModePolicy, PrimitiveToolName, Tool, ToolContext, ToolResult, ToolTier,
+};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -65,11 +67,15 @@ impl<E: Environment + 'static> Tool<()> for ReadTool<E> {
     }
 
     fn description(&self) -> &'static str {
-        "Read text files with 1-indexed line numbers. Also supports images (PNG/JPEG/GIF/WebP) and PDF documents."
+        "Read a file from the local filesystem. Text results include 1-indexed line numbers. Also supports images (PNG/JPEG/GIF/WebP) and PDF documents.\n\nUsage notes:\n- Provide a file path; relative paths are resolved against the environment root.\n- By default it returns up to 2000 lines from the start of the file.\n- Use offset and limit when you need a later section of a large file.\n- If you need to inspect multiple specific files, read them directly instead of shelling out to cat or head."
     }
 
     fn tier(&self) -> ToolTier {
         ToolTier::Observe
+    }
+
+    fn plan_mode_policy(&self) -> PlanModePolicy {
+        PlanModePolicy::Allowed
     }
 
     fn input_schema(&self) -> Value {

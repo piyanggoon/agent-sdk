@@ -1,6 +1,10 @@
 //! Context compaction implementation.
 
 use crate::llm::{ChatOutcome, ChatRequest, Content, ContentBlock, LlmProvider, Message, Role};
+use crate::prompts::{
+    DEFAULT_COMPACTION_SUMMARY_PROMPT_PREFIX, DEFAULT_COMPACTION_SUMMARY_PROMPT_SUFFIX,
+    DEFAULT_COMPACTION_SYSTEM_PROMPT,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use std::fmt::Write;
@@ -10,10 +14,6 @@ use super::config::CompactionConfig;
 use super::estimator::TokenEstimator;
 
 const SUMMARY_PREFIX: &str = "[Previous conversation summary]\n\n";
-const COMPACTION_SYSTEM_PROMPT: &str = "You are a precise summarizer. Your task is to create concise but complete summaries of conversations, preserving all technical details needed to continue the work.";
-const COMPACTION_SUMMARY_PROMPT_PREFIX: &str = "Summarize this conversation concisely, preserving:\n- Key decisions and conclusions reached\n- Important file paths, code changes, and technical details\n- Current task context and what has been accomplished\n- Any pending items, errors encountered, or next steps\n\nBe specific about technical details (file names, function names, error messages) as these\nare critical for continuing the work.\n\nConversation:\n";
-const COMPACTION_SUMMARY_PROMPT_SUFFIX: &str =
-    "Provide a concise summary (aim for 500-1000 words):";
 const COMPACT_EMPTY_SUMMARY: &str = "No additional context was available to summarize; the previous messages were already compacted.";
 const SUMMARY_ACKNOWLEDGMENT: &str =
     "I understand the context from the summary. Let me continue from where we left off.";
@@ -77,9 +77,9 @@ impl<P: LlmProvider> LlmContextCompactor<P> {
         Self {
             provider,
             config,
-            system_prompt: COMPACTION_SYSTEM_PROMPT.to_string(),
-            summary_prompt_prefix: COMPACTION_SUMMARY_PROMPT_PREFIX.to_string(),
-            summary_prompt_suffix: COMPACTION_SUMMARY_PROMPT_SUFFIX.to_string(),
+            system_prompt: DEFAULT_COMPACTION_SYSTEM_PROMPT.to_string(),
+            summary_prompt_prefix: DEFAULT_COMPACTION_SUMMARY_PROMPT_PREFIX.to_string(),
+            summary_prompt_suffix: DEFAULT_COMPACTION_SUMMARY_PROMPT_SUFFIX.to_string(),
         }
     }
 

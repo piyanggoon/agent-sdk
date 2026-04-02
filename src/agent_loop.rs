@@ -50,6 +50,7 @@ use crate::context::{CompactionConfig, ContextCompactor};
 use crate::events::{AgentEventEnvelope, SequenceCounter};
 use crate::hooks::AgentHooks;
 use crate::llm::LlmProvider;
+use crate::prompts::ensure_default_system_prompt;
 use crate::stores::{MessageStore, StateStore, ToolExecutionStore};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{AgentConfig, AgentInput, AgentRunState, ThreadId, TurnOutcome};
@@ -163,8 +164,14 @@ where
         hooks: H,
         message_store: M,
         state_store: S,
-        config: AgentConfig,
+        mut config: AgentConfig,
     ) -> Self {
+        ensure_default_system_prompt(
+            &mut config.system_prompt,
+            Some(&tools),
+            false,
+            config.plan_mode.enabled,
+        );
         Self {
             provider: Arc::new(provider),
             tools: Arc::new(tools),
@@ -188,9 +195,15 @@ where
         hooks: H,
         message_store: M,
         state_store: S,
-        config: AgentConfig,
+        mut config: AgentConfig,
         compaction_config: CompactionConfig,
     ) -> Self {
+        ensure_default_system_prompt(
+            &mut config.system_prompt,
+            Some(&tools),
+            true,
+            config.plan_mode.enabled,
+        );
         Self {
             provider: Arc::new(provider),
             tools: Arc::new(tools),

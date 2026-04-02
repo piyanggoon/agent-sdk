@@ -14,6 +14,12 @@
 //! - [`AgentState`]: Checkpointable agent state
 
 use crate::llm::ContentBlock;
+use crate::memory::MemoryConfig;
+use crate::plan_mode::{
+    METADATA_LAST_APPROVED_PLAN, METADATA_PLAN_ARTIFACT, METADATA_PLAN_MODE_ALLOWED_TOOLS,
+    METADATA_PLAN_MODE_DISCIPLINE_RETRIES, METADATA_PLAN_MODE_ENABLED, PlanArtifact,
+    PlanModeConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use time::OffsetDateTime;
@@ -62,6 +68,10 @@ pub struct AgentConfig {
     pub model: String,
     /// Retry configuration for transient errors
     pub retry: RetryConfig,
+    /// Session memory extraction and recall configuration.
+    pub memory: MemoryConfig,
+    /// Read-only planning mode configuration.
+    pub plan_mode: PlanModeConfig,
     /// Enable streaming responses from the LLM.
     ///
     /// When `true`, emits `TextDelta` and `ThinkingDelta` events as text arrives
@@ -78,8 +88,40 @@ impl Default for AgentConfig {
             system_prompt: String::new(),
             model: String::from("claude-sonnet-4-5-20250929"),
             retry: RetryConfig::default(),
+            memory: MemoryConfig::default(),
+            plan_mode: PlanModeConfig::default(),
             streaming: false,
         }
+    }
+}
+
+impl AgentConfig {
+    /// Enable plan mode using the default configuration.
+    #[must_use]
+    pub fn with_plan_mode(mut self) -> Self {
+        self.plan_mode = PlanModeConfig::enabled();
+        self
+    }
+
+    /// Override the plan mode configuration.
+    #[must_use]
+    pub fn with_plan_mode_config(mut self, config: PlanModeConfig) -> Self {
+        self.plan_mode = config;
+        self
+    }
+
+    /// Enable session memory extraction with default settings.
+    #[must_use]
+    pub fn with_memory(mut self) -> Self {
+        self.memory = MemoryConfig::enabled();
+        self
+    }
+
+    /// Override the session memory configuration.
+    #[must_use]
+    pub fn with_memory_config(mut self, config: MemoryConfig) -> Self {
+        self.memory = config;
+        self
     }
 }
 
@@ -198,6 +240,12 @@ impl ToolResult {
         self
     }
 
+    #[must_use]
+    pub fn with_data(mut self, data: serde_json::Value) -> Self {
+        self.data = Some(data);
+        self
+    }
+
     /// Attach documents (PDFs, images) to be sent back to the LLM as native content blocks.
     ///
     /// Use this when a tool produces a binary document that the model should read directly,
@@ -249,6 +297,95 @@ impl AgentState {
             metadata: HashMap::new(),
             created_at: OffsetDateTime::now_utc(),
         }
+    }
+
+    #[must_use]
+    pub fn plan_mode_enabled(&self) -> bool {
+        self.metadata
+            .get(METADATA_PLAN_MODE_ENABLED)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub fn set_plan_mode_enabled(&mut self, enabled: bool) {
+        self.metadata.insert(
+            METADATA_PLAN_MODE_ENABLED.to_string(),
+            serde_json::Value::Bool(enabled),
+        );
+    }
+
+    #[must_use]
+    pub fn plan_mode_allowed_tools(&self) -> Vec<String> {
+        self.metadata
+            .get(METADATA_PLAN_MODE_ALLOWED_TOOLS)
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn set_plan_mode_allowed_tools(&mut self, tools: Vec<String>) {
+        self.metadata.insert(
+            METADATA_PLAN_MODE_ALLOWED_TOOLS.to_string(),
+            serde_json::Value::Array(tools.into_iter().map(serde_json::Value::String).collect()),
+        );
+    }
+
+    #[must_use]
+    pub fn plan_artifact(&self) -> Option<PlanArtifact> {
+        self.metadata
+            .get(METADATA_PLAN_ARTIFACT)
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+
+    pub fn set_plan_artifact(&mut self, artifact: PlanArtifact) {
+        if let Ok(value) = serde_json::to_value(artifact) {
+            self.metadata
+                .insert(METADATA_PLAN_ARTIFACT.to_string(), value);
+        }
+    }
+
+    #[must_use]
+    pub fn approved_plan(&self) -> Option<String> {
+        self.plan_artifact()
+            .and_then(|artifact| artifact.approved_plan)
+            .or_else(|| {
+                self.metadata
+                    .get(METADATA_LAST_APPROVED_PLAN)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+    }
+
+    #[must_use]
+    pub fn plan_mode_discipline_retries(&self) -> u64 {
+        self.metadata
+            .get(METADATA_PLAN_MODE_DISCIPLINE_RETRIES)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    }
+
+    pub fn set_plan_mode_discipline_retries(&mut self, retries: u64) {
+        self.metadata.insert(
+            METADATA_PLAN_MODE_DISCIPLINE_RETRIES.to_string(),
+            serde_json::Value::Number(serde_json::Number::from(retries)),
+        );
+    }
+
+    #[must_use]
+    pub fn increment_plan_mode_discipline_retries(&mut self) -> u64 {
+        let next = self.plan_mode_discipline_retries().saturating_add(1);
+        self.set_plan_mode_discipline_retries(next);
+        next
+    }
+
+    pub fn reset_plan_mode_discipline_retries(&mut self) {
+        self.set_plan_mode_discipline_retries(0);
     }
 }
 

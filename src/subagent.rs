@@ -32,15 +32,19 @@
 //! 3. Only the final text response is returned to the parent
 //! 4. The parent does not see the subagent's intermediate tool calls
 
+mod builtin;
 mod factory;
+mod task_tool;
 
+pub use builtin::{BuiltInSubagent, built_in_subagent_config};
 pub use factory::SubagentFactory;
+pub use task_tool::TaskTool;
 
 use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 use crate::hooks::{AgentHooks, DefaultHooks};
 use crate::llm::LlmProvider;
 use crate::stores::{InMemoryStore, MessageStore, StateStore};
-use crate::tools::{DynamicToolName, Tool, ToolContext, ToolRegistry};
+use crate::tools::{DynamicToolName, PlanModePolicy, Tool, ToolContext, ToolRegistry};
 use crate::types::{AgentConfig, AgentInput, ThreadId, TokenUsage, ToolResult, ToolTier};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -68,6 +72,9 @@ pub struct SubagentConfig {
     pub name: String,
     /// System prompt for the subagent.
     pub system_prompt: String,
+    /// Optional description of when the subagent should be used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Maximum number of turns before stopping.
     pub max_turns: Option<usize>,
     /// Optional timeout in milliseconds.
@@ -84,16 +91,54 @@ impl SubagentConfig {
         Self {
             name: name.into(),
             system_prompt: String::new(),
+            description: None,
             max_turns: None,
             timeout_ms: None,
             model: None,
         }
     }
 
+    /// Create the built-in explore subagent configuration.
+    #[must_use]
+    pub fn explore() -> Self {
+        builtin::built_in_subagent_config(BuiltInSubagent::Explore)
+    }
+
+    /// Create the built-in planning subagent configuration.
+    #[must_use]
+    pub fn plan() -> Self {
+        builtin::built_in_subagent_config(BuiltInSubagent::Plan)
+    }
+
+    /// Create the built-in verification subagent configuration.
+    #[must_use]
+    pub fn verification() -> Self {
+        builtin::built_in_subagent_config(BuiltInSubagent::Verification)
+    }
+
+    /// Create the built-in code review subagent configuration.
+    #[must_use]
+    pub fn code_review() -> Self {
+        builtin::built_in_subagent_config(BuiltInSubagent::CodeReview)
+    }
+
+    /// Create the built-in general-purpose subagent configuration.
+    #[must_use]
+    pub fn general_purpose() -> Self {
+        builtin::built_in_subagent_config(BuiltInSubagent::GeneralPurpose)
+    }
+
     /// Set the system prompt.
     #[must_use]
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = prompt.into();
+        self
+    }
+
+    /// Set the subagent tool description.
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
         self
     }
 
@@ -212,13 +257,13 @@ where
     pub fn new(config: SubagentConfig, provider: Arc<P>, tools: Arc<ToolRegistry<()>>) -> Self {
         // Cache leaked strings at construction time (bounded by number of tools)
         let cached_display_name = Box::leak(format!("Subagent: {}", config.name).into_boxed_str());
-        let cached_description = Box::leak(
+        let description = config.description.clone().unwrap_or_else(|| {
             format!(
-                "Spawn a subagent named '{}' to handle a task. The subagent will work independently and return only its final response.",
+                "Spawn a subagent named '{}' to handle a task. The subagent works independently and returns only its final response. Use it for isolated research, parallel investigation, or multi-step work that would otherwise clutter your own context; avoid using it for simple file reads or narrow searches.",
                 config.name
             )
-            .into_boxed_str(),
-        );
+        });
+        let cached_description = Box::leak(description.into_boxed_str());
         Self {
             config,
             provider,
@@ -304,10 +349,29 @@ where
         parent_seq: Option<SequenceCounter>,
         parent_cancel: CancellationToken,
     ) -> Result<SubagentResult> {
+        self.run_subagent_on_thread(
+            task,
+            ThreadId::new(),
+            subagent_id,
+            parent_tx,
+            parent_seq,
+            parent_cancel,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_subagent_on_thread(
+        &self,
+        task: &str,
+        thread_id: ThreadId,
+        subagent_id: String,
+        parent_tx: Option<mpsc::Sender<AgentEventEnvelope>>,
+        parent_seq: Option<SequenceCounter>,
+        parent_cancel: CancellationToken,
+    ) -> Result<SubagentResult> {
         use crate::agent_loop::AgentLoop;
 
         let start = Instant::now();
-        let thread_id = ThreadId::new();
 
         // Create stores for this subagent run
         let message_store = (self.message_store_factory)();
@@ -633,8 +697,9 @@ fn summarize_tool_result(name: &str, result: &ToolResult) -> String {
     }
 }
 
-impl<P, H, M, S> Tool<()> for SubagentTool<P, H, M, S>
+impl<P, H, M, S, Ctx> Tool<Ctx> for SubagentTool<P, H, M, S>
 where
+    Ctx: Send + Sync + 'static,
     P: LlmProvider + Clone + 'static,
     H: AgentHooks + Clone + 'static,
     M: MessageStore + 'static,
@@ -672,7 +737,14 @@ where
         ToolTier::Confirm
     }
 
-    async fn execute(&self, ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
+    fn plan_mode_policy(&self) -> PlanModePolicy {
+        match self.config.name.as_str() {
+            "explore" | "plan" | "code_review" => PlanModePolicy::Allowed,
+            _ => PlanModePolicy::Blocked,
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
         let task = input
             .get("task")
             .and_then(Value::as_str)
@@ -765,6 +837,7 @@ mod tests {
 
         assert_eq!(config.name, "test");
         assert_eq!(config.system_prompt, "Test prompt");
+        assert_eq!(config.description, None);
         assert_eq!(config.max_turns, Some(5));
         assert_eq!(config.timeout_ms, Some(30000));
     }
@@ -775,8 +848,46 @@ mod tests {
 
         assert_eq!(config.name, "default");
         assert!(config.system_prompt.is_empty());
+        assert_eq!(config.description, None);
         assert_eq!(config.max_turns, None);
         assert_eq!(config.timeout_ms, None);
+    }
+
+    #[test]
+    fn test_built_in_subagent_configs() {
+        let explore = SubagentConfig::explore();
+        let plan = SubagentConfig::plan();
+        let verification = SubagentConfig::verification();
+        let code_review = SubagentConfig::code_review();
+        let general = SubagentConfig::general_purpose();
+
+        assert_eq!(explore.name, "explore");
+        assert!(explore.system_prompt.contains("READ-ONLY"));
+        assert!(explore.description.is_some());
+
+        assert_eq!(plan.name, "plan");
+        assert!(plan.system_prompt.contains("planning task"));
+        assert!(plan.description.is_some());
+
+        assert_eq!(verification.name, "verification");
+        assert!(
+            verification
+                .system_prompt
+                .contains("verification specialist")
+        );
+        assert!(verification.description.is_some());
+
+        assert_eq!(code_review.name, "code_review");
+        assert!(code_review.system_prompt.contains("READ-ONLY review task"));
+        assert!(code_review.description.is_some());
+
+        assert_eq!(general.name, "general_purpose");
+        assert!(
+            general
+                .system_prompt
+                .contains("general-purpose software engineering agent")
+        );
+        assert!(general.description.is_some());
     }
 
     #[test]
