@@ -39,13 +39,17 @@ mod task_tool;
 pub use builtin::{BuiltInSubagent, built_in_subagent_config};
 pub use factory::SubagentFactory;
 pub use task_tool::TaskTool;
+pub(crate) use task_tool::{apply_task_tool_results_to_state, sync_task_sessions_to_tool_context};
 
 use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 use crate::hooks::{AgentHooks, DefaultHooks};
 use crate::llm::LlmProvider;
 use crate::stores::{InMemoryStore, MessageStore, StateStore};
 use crate::tools::{DynamicToolName, PlanModePolicy, Tool, ToolContext, ToolRegistry};
-use crate::types::{AgentConfig, AgentInput, ThreadId, TokenUsage, ToolResult, ToolTier};
+use crate::types::{
+    AgentConfig, AgentContinuation, AgentInput, AgentRunState, ThreadId, TokenUsage, ToolResult,
+    ToolTier,
+};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -212,6 +216,19 @@ pub struct SubagentResult {
     /// tool execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_tool: Option<String>,
+    /// Confirmation state when the subagent paused on a confirm-tier tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_confirmation: Option<SubagentPendingConfirmation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubagentPendingConfirmation {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub display_name: String,
+    pub input: Value,
+    pub description: String,
+    pub continuation: Box<AgentContinuation>,
 }
 
 /// Tool for spawning subagents.
@@ -349,8 +366,8 @@ where
         parent_seq: Option<SequenceCounter>,
         parent_cancel: CancellationToken,
     ) -> Result<SubagentResult> {
-        self.run_subagent_on_thread(
-            task,
+        self.run_subagent_input_on_thread(
+            AgentInput::Text(task.to_string()),
             ThreadId::new(),
             subagent_id,
             parent_tx,
@@ -360,9 +377,9 @@ where
         .await
     }
 
-    pub(crate) async fn run_subagent_on_thread(
+    pub(crate) async fn run_subagent_input_on_thread(
         &self,
-        task: &str,
+        input: AgentInput,
         thread_id: ThreadId,
         subagent_id: String,
         parent_tx: Option<mpsc::Sender<AgentEventEnvelope>>,
@@ -400,12 +417,7 @@ where
         // Run with a child cancellation token so parent cancellation propagates
         let cancel_token = parent_cancel.child_token();
         let timeout_cancel = cancel_token.clone();
-        let (mut rx, _final_state) = agent.run(
-            thread_id,
-            AgentInput::Text(task.to_string()),
-            tool_ctx,
-            cancel_token,
-        );
+        let (mut rx, final_state) = agent.run(thread_id, input, tool_ctx, cancel_token);
 
         let mut final_response = String::new();
         let mut total_turns = 0;
@@ -417,6 +429,7 @@ where
         let mut success = true;
         let mut error_details: Option<String> = None;
         let mut failed_tool: Option<String> = None;
+        let mut pending_confirmation: Option<SubagentPendingConfirmation> = None;
 
         let timeout_duration = self.config.timeout_ms.map(Duration::from_millis);
 
@@ -545,6 +558,56 @@ where
             }
         }
 
+        if let Ok(final_state) = final_state.await {
+            match final_state {
+                AgentRunState::AwaitingConfirmation {
+                    tool_call_id,
+                    tool_name,
+                    display_name,
+                    input,
+                    description,
+                    continuation,
+                } => {
+                    pending_confirmation = Some(SubagentPendingConfirmation {
+                        tool_call_id,
+                        tool_name: tool_name.clone(),
+                        display_name,
+                        input,
+                        description: description.clone(),
+                        continuation,
+                    });
+                    success = false;
+                    if final_response.is_empty() {
+                        final_response =
+                            format!("Subagent paused because `{tool_name}` requires confirmation.");
+                    }
+                    error_details = Some(description);
+                }
+                AgentRunState::Error(error) => {
+                    success = false;
+                    if error_details.is_none() {
+                        error_details = Some(error.message.clone());
+                    }
+                    if final_response.is_empty() {
+                        final_response = error.message;
+                    }
+                }
+                AgentRunState::Refusal { .. } => {
+                    success = false;
+                    if final_response.is_empty() {
+                        final_response = "Subagent refused the request".to_string();
+                    }
+                }
+                AgentRunState::Cancelled { .. } => {
+                    success = false;
+                    if final_response.is_empty() {
+                        final_response = "Subagent was cancelled".to_string();
+                    }
+                }
+                AgentRunState::Done { .. } => {}
+            }
+        }
+
         let result = SubagentResult {
             name: self.config.name.clone(),
             final_response,
@@ -556,6 +619,7 @@ where
             duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
             error_details,
             failed_tool,
+            pending_confirmation,
         };
 
         #[cfg(feature = "otel")]
@@ -814,9 +878,19 @@ where
             .run_subagent(task, subagent_id, parent_tx, parent_seq, cancel_token)
             .await?;
 
+        let success = result.success && result.pending_confirmation.is_none();
+        let output = if let Some(pending) = result.pending_confirmation.as_ref() {
+            format!(
+                "Subagent '{}' paused because `{}` requires confirmation. Direct subagent tools cannot resume confirmation loops; use the `task` tool for resumable specialist sessions or perform the action in the parent agent.\n\n{}",
+                self.config.name, pending.tool_name, pending.description
+            )
+        } else {
+            result.final_response.clone()
+        };
+
         Ok(ToolResult {
-            success: result.success,
-            output: result.final_response.clone(),
+            success,
+            output,
             data: Some(serde_json::to_value(&result).unwrap_or_default()),
             documents: Vec::new(),
             duration_ms: Some(result.duration_ms),
@@ -920,6 +994,7 @@ mod tests {
             duration_ms: 1000,
             error_details: None,
             failed_tool: None,
+            pending_confirmation: None,
         };
 
         let json = serde_json::to_string(&result).expect("serialize");
@@ -954,6 +1029,7 @@ mod tests {
             duration_ms: 2500,
             error_details: None,
             failed_tool: None,
+            pending_confirmation: None,
         };
 
         let value = serde_json::to_value(&result).expect("serialize to value");

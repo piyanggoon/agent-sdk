@@ -1,3 +1,4 @@
+use crate::llm::ContentBlock;
 use serde::{Deserialize, Serialize};
 
 use crate::types::AgentState;
@@ -92,6 +93,29 @@ pub(crate) fn update_memories_from_user_text(
     }
 
     state.set_session_memories(memories);
+}
+
+pub(crate) fn update_memories_from_blocks(
+    state: &mut AgentState,
+    config: &MemoryConfig,
+    blocks: &[ContentBlock],
+) {
+    if !config.enabled || config.max_memories == 0 {
+        return;
+    }
+
+    let text = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if !text.is_empty() {
+        update_memories_from_user_text(state, config, &text);
+    }
 }
 
 #[must_use]
@@ -228,5 +252,27 @@ mod tests {
         let prompt = memory_prompt_suffix(&state);
         assert!(prompt.contains("Session Memory"));
         assert!(prompt.contains("minimal patches"));
+    }
+
+    #[test]
+    fn extracts_memories_from_text_blocks() {
+        let mut state = AgentState::new(ThreadId::from_string("thread"));
+        update_memories_from_blocks(
+            &mut state,
+            &MemoryConfig::enabled(),
+            &[
+                ContentBlock::Text {
+                    text: "Please use compact responses.".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "When you're done, open a PR.".to_string(),
+                },
+            ],
+        );
+
+        let memories = state.session_memories();
+        assert_eq!(memories.len(), 2);
+        assert!(memories.iter().any(|m| m.kind == MemoryKind::Preference));
+        assert!(memories.iter().any(|m| m.kind == MemoryKind::Workflow));
     }
 }

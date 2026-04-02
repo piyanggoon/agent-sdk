@@ -11,12 +11,13 @@ use super::types::{
 use crate::events::{AgentEvent, AgentEventEnvelope, SequenceCounter};
 use crate::hooks::AgentHooks;
 use crate::llm::{Content, ContentBlock, LlmProvider, Message, Role};
-use crate::memory::update_memories_from_user_text;
+use crate::memory::{update_memories_from_blocks, update_memories_from_user_text};
 use crate::plan_mode::{
     PlanArtifact, apply_pending_confirmation_to_state, apply_tool_results_to_state,
     ensure_plan_mode_artifact,
 };
 use crate::stores::{MessageStore, StateStore};
+use crate::subagent::{apply_task_tool_results_to_state, sync_task_sessions_to_tool_context};
 use crate::types::{
     AgentContinuation, AgentError, AgentInput, AgentRunState, AgentState, ThreadId, TokenUsage,
     TurnOutcome,
@@ -113,13 +114,16 @@ where
                 }
             };
 
-            let user_msg = Message::user_with_content(blocks);
+            let user_msg = Message::user_with_content(blocks.clone());
             if let Err(e) = message_store.append(thread_id, user_msg).await {
                 return Err(AgentError::new(
                     format!("Failed to append message: {e}"),
                     false,
                 ));
             }
+
+            let mut state = state;
+            update_memories_from_blocks(&mut state, memory_config, &blocks);
 
             Ok(InitializedState {
                 turn: 0,
@@ -258,7 +262,9 @@ where
     };
     let result = execute_confirmed_tool(awaiting_tool, rejection, &confirmed_ctx).await;
     apply_tool_results_to_state(state, &[(awaiting_tool.id.clone(), result.clone())]);
+    apply_task_tool_results_to_state(state, &[(awaiting_tool.id.clone(), result.clone())]);
     live_tool_context.set_plan_mode(state.plan_mode_enabled(), state.plan_mode_allowed_tools());
+    sync_task_sessions_to_tool_context(state, &mut live_tool_context);
     tool_results.push((awaiting_tool.id.clone(), result));
 
     for pending in cont.pending_tool_calls.iter().skip(cont.awaiting_index + 1) {
@@ -274,8 +280,10 @@ where
         match execute_tool_call(pending, &execution_ctx).await {
             ToolExecutionOutcome::Completed { tool_id, result } => {
                 apply_tool_results_to_state(state, &[(tool_id.clone(), result.clone())]);
+                apply_task_tool_results_to_state(state, &[(tool_id.clone(), result.clone())]);
                 live_tool_context
                     .set_plan_mode(state.plan_mode_enabled(), state.plan_mode_allowed_tools());
+                sync_task_sessions_to_tool_context(state, &mut live_tool_context);
                 tool_results.push((tool_id, result));
             }
             ToolExecutionOutcome::RequiresConfirmation {
@@ -473,15 +481,17 @@ where
                                         warn!("Failed to append injected message: {e}");
                                         return None;
                                     }
+                                    update_memories_from_user_text(&mut ctx.state, &config.memory, &text);
                                     ctx.turn += 1;
                                     // Continue the loop for the next turn
                                 }
                                 Some(AgentInput::Message(blocks)) => {
-                                    let user_msg = Message::user_with_content(blocks);
+                                    let user_msg = Message::user_with_content(blocks.clone());
                                     if let Err(e) = message_store.append(&ctx.thread_id, user_msg).await {
                                         warn!("Failed to append injected message: {e}");
                                         return None;
                                     }
+                                    update_memories_from_blocks(&mut ctx.state, &config.memory, &blocks);
                                     ctx.turn += 1;
                                 }
                                 _ => return None, // Channel closed or unsupported input
@@ -807,8 +817,9 @@ where
     } = init_state;
 
     apply_plan_mode_to_state(&config, &mut state);
-    let tool_context =
+    let mut tool_context =
         tool_context.with_plan_mode(state.plan_mode_enabled(), state.plan_mode_allowed_tools());
+    sync_task_sessions_to_tool_context(&state, &mut tool_context);
 
     if let Some(resume_data) = resume_data {
         let resume_result = handle_run_loop_resume(RunLoopResumeParams {
@@ -1041,8 +1052,9 @@ where
     } = init_state;
 
     apply_plan_mode_to_state(&config, &mut state);
-    let tool_context =
+    let mut tool_context =
         tool_context.with_plan_mode(state.plan_mode_enabled(), state.plan_mode_allowed_tools());
+    sync_task_sessions_to_tool_context(&state, &mut tool_context);
 
     if let Some(resume_data) = resume_data {
         return handle_single_turn_resume(SingleTurnResumeParams {

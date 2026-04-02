@@ -21,6 +21,7 @@ use crate::plan_mode::{
 };
 use crate::prompts::runtime_environment_prompt_suffix;
 use crate::stores::{MessageStore, StateStore, ToolExecutionStore};
+use crate::subagent::{apply_task_tool_results_to_state, sync_task_sessions_to_tool_context};
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::types::{
     AgentConfig, AgentContinuation, AgentError, PendingToolCallInfo, ThreadId, TokenUsage,
@@ -786,8 +787,10 @@ where
         match execute_tool_call(&pending, &execution_ctx).await {
             ToolExecutionOutcome::Completed { tool_id, result } => {
                 apply_tool_results_to_state(state, &[(tool_id.clone(), result.clone())]);
+                apply_task_tool_results_to_state(state, &[(tool_id.clone(), result.clone())]);
                 live_tool_context
                     .set_plan_mode(state.plan_mode_enabled(), state.plan_mode_allowed_tools());
+                sync_task_sessions_to_tool_context(state, &mut live_tool_context);
                 tool_results.push((tool_id, result));
             }
             ToolExecutionOutcome::RequiresConfirmation {

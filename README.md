@@ -714,6 +714,10 @@ The tool accepts:
 - `task`: subagent instruction or follow-up
 - `subagent_type`: optional preset like `explore`, `plan`, `verification`, `code_review`, or `general_purpose`
 - `task_id`: optional prior session id to continue the same subagent session
+- `confirmed`: optional confirmation decision when resuming a paused task session
+- `rejection_reason`: optional reason when rejecting a paused confirm-tier tool
+
+Task sessions are snapshotted into the parent thread state, so they can be restored by a fresh `TaskTool` instance when the parent `StateStore` is durable.
 
 ## Built-in Skills And Prompt Presets
 
@@ -754,6 +758,7 @@ let config = AgentConfig::default().with_memory_config(
 ```
 
 The SDK extracts sticky preferences and workflow instructions from user text and injects them back into subsequent prompts as session memory.
+Because the memories are stored in `AgentState`, they persist across restarts when your `StateStore` persists thread state.
 
 ## Environment Details
 
